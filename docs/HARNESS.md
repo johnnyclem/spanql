@@ -1,6 +1,6 @@
 # Agent harness
 
-> Design phase.
+> The agent loop, tools, CLI and the HTTP endpoints for sources, ingest jobs, ask, evaluate, cells, runs and spans are implemented; the web UI, SSE streaming, the OpenAI-compatible shim, `/metrics` and the MCP server are not. See [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 The harness is the "agent app": it turns a chat message into retrieval, one or more formula attempts, evaluation, verification, and a rendered answer. It is deliberately a **bounded loop with a fixed toolset**, not an open-ended agent: the model never runs shell commands, never reads files directly, and never sees more than the candidates the harness gives it.
 

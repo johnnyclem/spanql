@@ -1,0 +1,40 @@
+# spanql configuration. Copy to ./config.toml or ~/.config/spanql/config.toml,
+# or point SPANQL_CONFIG at it. Any value can be overridden with SPANQL_<SECTION>__<KEY>,
+# e.g. SPANQL_MODEL__ENDPOINT=http://127.0.0.1:7718/v1
+
+[server]
+bind = "127.0.0.1:7717"        # binding anywhere else requires SPANQL_API_TOKEN
+
+[store]
+path = "~/.local/share/spanql/spanql.db"
+snapshot_retention_days = 90    # used by `spanql gc`
+
+# `spanql ingest` with no arguments ingests these. `watch` is accepted but not implemented yet.
+# [[sources]]
+# path = "~/Documents/kb"
+# kind = "doc"                  # doc | log | file | code (default: detected per file)
+#
+# [[sources]]
+# path = "~/src/payments"       # a git repo: `git ls-files` decides what is included
+# kind = "code"
+#
+# [[sources]]
+# path = "/var/log/myapp/*.log"
+# kind = "log"
+# parser = "auto"               # auto | jsonl | nginx | iso | syslog | plain | re:<regex with named groups>
+
+[model]
+runtime = "external"            # "managed" is not implemented yet: run llama-server yourself
+backend = "llama.cpp"           # llama.cpp -> grammar-constrained decoding; anything else -> "openai-compatible"
+model = "spanql"
+endpoint = "http://127.0.0.1:7718/v1"   # empty string = no model (ingest/evaluate/serve still work)
+api_key = ""                    # or SPANQL_MODEL_API_KEY
+timeout = 60
+thinking = false                # sends enable_thinking=false to llama.cpp for Qwen3.x non-thinking mode
+
+[harness]
+max_attempts = 3
+candidate_token_budget = 8192
+relevance_check = true          # V6: one yes/no model call per cited passage
+max_seconds = 30
+k = 40
