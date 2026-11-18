@@ -1,6 +1,6 @@
 # Architecture
 
-> Design phase. Nothing here is implemented. Names, schemas and grammar are proposals.
+> The span store, formula language, engine, verifier and provenance described here are implemented (see [IMPLEMENTATION.md](IMPLEMENTATION.md), which also lists every place the code differs from or resolves an ambiguity in this document). The Docling converters, tree-sitter symbols for non-Python languages, vectors and the Concussion-Protocol gate are not.
 
 spanql has three cooperating parts with a hard boundary between them:
 

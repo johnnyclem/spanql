@@ -1,6 +1,6 @@
 # Deployment
 
-> Design phase. File names, ports and paths are proposals.
+> Packaging (Docker, Compose, Homebrew, `spanql model pull`, managed `llama-server`) is **not implemented**; file names, ports and paths below are proposals. The configuration schema in section 1 *is* implemented (TOML plus `SPANQL_<SECTION>__<KEY>` overrides); see [`config.example.toml`](../config.example.toml) and [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 spanql ships two ways, from one codebase:
 

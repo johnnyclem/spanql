@@ -2,7 +2,20 @@
 
 **Ask questions of your documents, logs, files and codebases. Get answers you can audit like a spreadsheet.**
 
-> **Status: design phase.** This repository contains design documents only. There is no implementation yet, nothing to install, and every interface described here may change. See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: early implementation.** The deterministic core is built and tested: span store, ingestion, the formula language, the engine, the verifier, retrieval, the agent loop, a CLI and a small HTTP API. **No model has been run against it yet**, there is no web UI, and packaging is not done. Interfaces may still change. See [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) for exactly what exists and [docs/ROADMAP.md](docs/ROADMAP.md) for what's next.
+
+## Try it (no model needed)
+
+```sh
+pip install -e .                 # Python 3.12+, no third-party dependencies
+spanql selftest                  # prints "ok"
+
+spanql ingest ./docs ./logs      # no-op for unchanged files; git repos honour .gitignore
+spanql evaluate 'ANSWER(COUNT(FIND(src:"logs/*.log", level:"ERROR", day:"2026-11-10")), text:"{0} errors.")'
+spanql trace c_AbC123            # the formula, each step, and the exact source characters used
+```
+
+`spanql ask "..."` needs a model: point `SPANQL_MODEL__ENDPOINT` at a llama.cpp server (see [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md#model) and [config.example.toml](config.example.toml)).
 
 ---
 
