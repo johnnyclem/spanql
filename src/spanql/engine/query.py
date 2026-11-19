@@ -4,16 +4,18 @@ returns the contributing spans so aggregates stay traceable."""
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from spanql.engine.errors import extraction, syntax
+from spanql.engine.errors import extraction, support, syntax
 from spanql.formula.ast import BoolLit, Call, Compare, Node, NumberLit, StringLit, unparse
 from spanql.ingest.logs import LEVELS
 from spanql.store.db import Span, Store
+from spanql.store.globs import glob_match
 
 SOURCE_KINDS = {"doc", "log", "file", "code"}
 BLOCK_KINDS = {
@@ -162,6 +164,36 @@ def _sql_str(s: str) -> str:
     return s.replace("'", "''")
 
 
+def check_src(store: Store, pattern: str, fn: str, pos: int | None = None) -> None:
+    """V5: a ``src:`` glob that matches no ingested source is an error, not "0 matches".
+
+    Otherwise a typo (``logz/*.log``) silently counts nothing. The hint lists the closest
+    source URIs so the model (or the user) can fix the glob."""
+    uris = [r["uri"] for r in store.query("SELECT uri FROM source WHERE removed = 0 ORDER BY uri")]
+    if any(glob_match(pattern, u) for u in uris):
+        return
+    if not uris:
+        raise support(
+            f"{fn}: src:{pattern!r} matches no source; nothing has been ingested", pos=pos
+        )
+    target = pattern.replace("**/", "").replace("*", "")
+    ranked = sorted(
+        uris,
+        key=lambda u: (
+            -max(
+                difflib.SequenceMatcher(None, target, u).ratio(),
+                difflib.SequenceMatcher(None, target, u.split("/", 1)[-1]).ratio(),
+            ),
+            u,
+        ),
+    )
+    raise support(
+        f"{fn}: src:{pattern!r} matches no ingested source",
+        hint="did you mean " + ", ".join(repr(u) for u in ranked[:3]) + "?",
+        pos=pos,
+    )
+
+
 _BASE = (
     "SELECT b.id, b.snapshot_id, b.start, b.end, src.uri FROM block b\n"
     "JOIN source src ON src.current_snapshot = b.snapshot_id AND src.removed = 0\n"
@@ -172,10 +204,14 @@ _BASE = (
 )
 
 
-def _common(bld: _Builder, call: Call, fn: str, *, default_kinds: bool = True) -> None:
+def _common(
+    store: Store, bld: _Builder, call: Call, fn: str, *, default_kinds: bool = True
+) -> None:
     src = call.kw("src")
     if src is not None:
-        bld.add("spanql_glob(?, src.uri)", _lit(src, "src", fn))
+        pattern = _lit(src, "src", fn)
+        check_src(store, pattern, fn, src.pos)
+        bld.add("spanql_glob(?, src.uri)", pattern)
     kind = call.kw("kind")
     kind_v = _lit(kind, "kind", fn) if kind is not None else None
     if fn == "FIND":
@@ -223,7 +259,7 @@ def _fts_query(text: str) -> str:
 
 def run_find(store: Store, call: Call) -> QueryResult:
     bld = _Builder()
-    _common(bld, call, "FIND")
+    _common(store, bld, call, "FIND")
     if (m := call.kw("match")) is not None:
         bld.add(
             "b.id IN (SELECT rowid FROM block_fts WHERE block_fts MATCH ?)",
@@ -256,7 +292,7 @@ def run_find(store: Store, call: Call) -> QueryResult:
 
 def run_symbols(store: Store, call: Call) -> QueryResult:
     bld = _Builder()
-    _common(bld, call, "SYMBOLS")
+    _common(store, bld, call, "SYMBOLS")
     if (k := call.kw("kind")) is not None:
         kv = _lit(k, "kind", "SYMBOLS")
         kinds: set[str] = set()
@@ -294,7 +330,9 @@ def run_column(store: Store, call: Call) -> QueryResult:
     header = _lit(call.args[0], "header", "COLUMN")
     bld = _Builder()
     if (src := call.kw("src")) is not None:
-        bld.add("spanql_glob(?, src.uri)", _lit(src, "src", "COLUMN"))
+        pattern = _lit(src, "src", "COLUMN")
+        check_src(store, pattern, "COLUMN", src.pos)
+        bld.add("spanql_glob(?, src.uri)", pattern)
     for pred in call.args[1:]:
         bld.where.append(bld.predicate(pred, "COLUMN"))
     where = " AND ".join(bld.where) if bld.where else "1"
@@ -348,8 +386,10 @@ def run_lines(store: Store, call: Call) -> QueryResult:
         raise syntax(f"LINES: invalid regex {pattern!r}: {exc}") from exc
     where, params = ["src.removed = 0", "src.current_snapshot IS NOT NULL"], []
     if (src := call.kw("src")) is not None:
+        pattern = _lit(src, "src", "LINES")
+        check_src(store, pattern, "LINES", src.pos)
         where.append("spanql_glob(?, src.uri)")
-        params.append(_lit(src, "src", "LINES"))
+        params.append(pattern)
     if (k := call.kw("kind")) is not None:
         where.append("src.kind = ?")
         params.append(_lit(k, "kind", "LINES"))

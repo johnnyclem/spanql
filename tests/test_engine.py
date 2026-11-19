@@ -324,3 +324,36 @@ def test_v4_template_cannot_add_units(demo_store: Store, template: str) -> None:
 def test_template_prose_after_placeholder_ok(demo_store: Store) -> None:
     out = ev(demo_store, 'ANSWER(MONEY($1."$4.82 million"), text:"{0} in Q3 revenue (Kept)")', Q3)
     assert out.status == "grounded", out.problems
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        'ANSWER(COUNT(FIND(src:"demo/logz/*.log", match:"PaymentTimeout")))',
+        'ANSWER(SUM(COLUMN(src:"demo/data/invoice.csv", "amount")))',
+        'ANSWER(COUNT(SYMBOLS(src:"demo/rep/**", kind:"function")))',
+        'ANSWER(COUNT(LINES(src:"nope.txt", re:"x")))',
+    ],
+)
+def test_v5_src_matching_nothing_is_an_error_with_suggestions(
+    demo_store: Store, formula: str
+) -> None:
+    out = ev(demo_store, formula, question="How many are there?")
+    assert out.status == "error" and "V5" in codes(out), out.problems
+    p = out.problems[0]
+    assert "matches no ingested source" in p.message
+    assert p.hint and p.hint.startswith("did you mean")
+
+
+def test_v5_typo_suggestion_names_the_right_source(demo_store: Store) -> None:
+    out = ev(
+        demo_store, 'ANSWER(COUNT(FIND(src:"demo/logz/payments-*.log")))', question="How many?"
+    )
+    assert "demo/logs/payments-2026-11-10.log" in (out.problems[0].hint or "")
+    # a glob that matches but finds nothing is still a legitimate zero for a count question
+    ok = ev(
+        demo_store,
+        'ANSWER(COUNT(FIND(src:"demo/logs/*.log", re:"NoSuchThing")))',
+        question="How many?",
+    )
+    assert ok.status == "grounded" and ok.cells[0]["value"]["decimal"] == "0"
