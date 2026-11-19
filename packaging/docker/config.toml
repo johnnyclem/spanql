@@ -1,0 +1,31 @@
+# spanql config baked into the Docker image. Override any key with SPANQL_<SECTION>__<KEY>,
+# or mount your own file over /config/config.toml.
+
+[server]
+# Inside the container we must listen on all interfaces. compose.yaml publishes the port on
+# the host's 127.0.0.1 only. For any other exposure set SPANQL_API_TOKEN instead.
+bind = "0.0.0.0:7717"
+allow_unauthenticated = true
+
+[store]
+path = "/data/spanql.db"
+snapshot_retention_days = 90
+
+# Everything mounted under /sources (read-only) is ingested at startup.
+[[sources]]
+path = "/sources"
+kind = "auto"
+name = "sources"
+
+[model]
+runtime = "external"                 # the llama.cpp sidecar
+backend = "llama.cpp"
+model = "qwen3.5-4b-instruct-q4_k_m"
+endpoint = "http://llm:8080/v1"
+models_dir = "/models"
+
+[harness]
+max_attempts = 3
+candidate_token_budget = 8192
+max_candidates = 12
+relevance_check = false

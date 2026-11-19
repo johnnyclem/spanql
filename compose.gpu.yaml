@@ -1,0 +1,10 @@
+# NVIDIA GPU override: docker compose -f compose.yaml -f compose.gpu.yaml up -d
+services:
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    command: ["-m", "/models/qwen3.5-4b-instruct-q4_k_m.gguf", "-c", "16384", "--jinja",
+              "-ngl", "99", "--host", "0.0.0.0", "--port", "8080"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
