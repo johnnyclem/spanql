@@ -64,12 +64,12 @@ ANSWER(MONEY($1."$4.82 million"), text:"Q3 revenue was {0}.")
 
 Example 2
 CANDIDATES:
-[$1] wiki/q3.md · L2
-     Q3 revenue: $7.1M
-[$2] wiki/q2.md · L9
+[$1] wiki/q2.md · L9
      Revenue in Q2 came to $6.5M.
+[$2] wiki/q3.md · L2
+     Q3 revenue: $7.1M
 QUESTION: How much did revenue grow from Q2 to Q3?
-ANSWER(DIFF(MONEY($1."$7.1M"), MONEY($2."$6.5M")), PCT([0], MONEY($2."$6.5M"), places:1), text:"Revenue grew by {0} ({1}).")
+ANSWER(DIFF(MONEY($2."$7.1M"), MONEY($1."$6.5M")), PCT([0], MONEY($1."$6.5M"), places:1), text:"Revenue grew by {0} ({1}).")
 
 Example 3
 CANDIDATES:
