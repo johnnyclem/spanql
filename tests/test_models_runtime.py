@@ -95,14 +95,17 @@ def test_managed_runtime_command(tmp_path: Path) -> None:
 
 
 FAKE_SERVER = """#!/usr/bin/env python3
-import sys, http.server
+import sys, http.server, socketserver
 port = int(sys.argv[sys.argv.index("--port") + 1])
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b'{"status":"ok"}')
     def log_message(self, *a):
         pass
-srv = http.server.HTTPServer(("127.0.0.1", port), H)
+class S(http.server.HTTPServer):
+    def server_bind(self):  # skip HTTPServer's getfqdn(), which can hang on macOS runners
+        socketserver.TCPServer.server_bind(self)
+srv = S(("127.0.0.1", port), H)
 print("listening", port, file=sys.stderr, flush=True)
 srv.serve_forever()
 """
