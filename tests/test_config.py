@@ -78,3 +78,28 @@ def test_rendered_default_config_loads(tmp_path: Path) -> None:
     cfg = load_config(p, env={})
     assert cfg.model.runtime == "managed"
     assert cfg.models_dir == tmp_path / "m"
+
+
+def test_explicit_unauthenticated_opt_in() -> None:
+    cfg = load_config(
+        env={"SPANQL_SERVER__BIND": "0.0.0.0:7717", "SPANQL_SERVER__ALLOW_UNAUTHENTICATED": "true"}
+    )
+    assert cfg.server.allow_unauthenticated is True and cfg.server.api_token is None
+
+
+def test_homebrew_prefix_detection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import sys
+
+    from spanql import config as C
+
+    keg = tmp_path / "Cellar" / "spanql" / "HEAD-abc" / "libexec"
+    keg.mkdir(parents=True)
+    monkeypatch.setattr(sys, "prefix", str(keg))
+    assert C.homebrew_prefix() == tmp_path
+    etc = tmp_path / "etc" / "spanql"
+    etc.mkdir(parents=True)
+    (etc / "config.toml").write_text("[model]\nbackend = 'fake'\n")
+    monkeypatch.chdir(tmp_path)
+    assert C.default_config_path() == etc / "config.toml"
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "venv"))
+    assert C.homebrew_prefix() is None

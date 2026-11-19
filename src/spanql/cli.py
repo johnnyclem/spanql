@@ -41,15 +41,24 @@ def _services(args: argparse.Namespace) -> Any:
 
 # ------------------------------------------------------------------- commands
 def cmd_init(args: argparse.Namespace) -> int:
-    from spanql.config import config_home, data_home
+    from spanql.config import config_home, data_home, homebrew_prefix
 
+    if args.homebrew:
+        brew = homebrew_prefix()
+        if brew is None:
+            print("--homebrew: spanql is not running from a Homebrew keg", file=sys.stderr)
+            return 2
+        args.config = args.config or str(brew / "etc" / "spanql" / "config.toml")
+        args.store = args.store or str(brew / "var" / "spanql" / "spanql.db")
+        args.models_dir = args.models_dir or str(brew / "var" / "spanql" / "models")
+        args.runtime = args.runtime or "managed"
     target = Path(args.config or os.environ.get("SPANQL_CONFIG") or config_home() / "config.toml")
     target = target.expanduser()
     if target.exists() and not args.force:
         print(f"config already exists: {target} (use --force to overwrite)")
         return 0
     target.parent.mkdir(parents=True, exist_ok=True)
-    runtime = "managed" if shutil.which("llama-server") else "external"
+    runtime = args.runtime or ("managed" if shutil.which("llama-server") else "external")
     store = Path(args.store).expanduser() if args.store else data_home() / "spanql.db"
     models = (
         Path(args.models_dir).expanduser()
@@ -279,7 +288,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     cfg = _load(args)
     if args.host or args.port:
         cfg.server.bind = f"{args.host or cfg.server.host}:{args.port or cfg.server.port}"
-        if not cfg.server.is_loopback and not cfg.server.api_token:
+        if (
+            not cfg.server.is_loopback
+            and not cfg.server.api_token
+            and not cfg.server.allow_unauthenticated
+        ):
             print(
                 "refusing to bind a non-loopback address without SPANQL_API_TOKEN", file=sys.stderr
             )
@@ -303,6 +316,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
         rep = svc.ingest()
         print(f"ingested: {rep.added} added, {rep.updated} updated, {rep.unchanged} unchanged")
     app = create_app(svc)
+    if not cfg.server.is_loopback and not cfg.server.api_token:
+        print(
+            f"WARNING: {cfg.server.bind} is not loopback and has no API token "
+            "(server.allow_unauthenticated = true); make sure the port is not reachable "
+            "from other machines",
+            file=sys.stderr,
+        )
     print(f"spanql {__version__} listening on http://{cfg.server.bind}")
     try:
         uvicorn.run(app, host=cfg.server.host, port=cfg.server.port, log_level="warning")
@@ -487,12 +507,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--endpoint", help="override model.endpoint")
     p.add_argument("--model", help="override model.model")
     p.add_argument("-v", "--verbose", action="store_true")
+    # the same global options are accepted after the subcommand too
+    # (`spanql serve --config x.toml`, as the Homebrew service block runs it)
+    common = argparse.ArgumentParser(add_help=False)
+    for flag in ("--config", "--db", "--backend", "--endpoint", "--model"):
+        common.add_argument(flag, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
+    _add = sub.add_parser
+
+    def add_parser(name: str, **kw: Any) -> argparse.ArgumentParser:
+        return _add(name, parents=[common], **kw)
+
+    sub.add_parser = add_parser  # type: ignore[method-assign]
 
     s = sub.add_parser("init", help="write a default config file")
     s.add_argument("--force", action="store_true")
     s.add_argument("--store")
     s.add_argument("--models-dir")
+    s.add_argument(
+        "--runtime",
+        choices=["managed", "external"],
+        help="model runtime (default: managed if llama-server is on PATH)",
+    )
+    s.add_argument(
+        "--homebrew",
+        action="store_true",
+        help="use Homebrew paths: $(brew --prefix)/etc/spanql and var/spanql (formula post-install)",
+    )
     s.set_defaults(fn=cmd_init)
 
     s = sub.add_parser("ingest", help="ingest paths (or the configured sources)")

@@ -66,7 +66,7 @@ no_implicit_optional = true
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = [
-  "ignore:Using `httpx` with `starlette.testclient` is deprecated:DeprecationWarning",
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated",
 ]
 markers = [
   "live: needs a real model server (SPANQL_LIVE_ENDPOINT); skipped by default",

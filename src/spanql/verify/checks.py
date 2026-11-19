@@ -83,6 +83,12 @@ def check_literals(f: Formula) -> tuple[list[Problem], list[Problem]]:
     return errors, warnings
 
 
+# values are rendered with their own unit/currency/scale; prose must not add another one
+_UNIT_AFTER = re.compile(
+    r"\{\d+\}\s*(million|billion|thousand|trillion|percent|per cent|%|dollars?|euros?|pounds?"
+    r"|USD|EUR|GBP|k|K|M|MM|bn|B)(?![A-Za-z])"
+)
+_CURRENCY_BEFORE = re.compile(r"[$€£¥₹]\s*\{\d+\}")
 _QNUM = re.compile(r"\d[\d,.:/\-]*\d|\d")
 
 
@@ -100,6 +106,19 @@ def check_template(f: Formula, question: str | None = None) -> list[Problem]:
                     "V1",
                     f"template placeholder {{{m.group(1)}}} has no value",
                     f"use {{0}}..{{{len(f.exprs) - 1}}}",
+                    f.pos,
+                )
+            )
+    for rx, what in (
+        (_UNIT_AFTER, "a unit or scale word after"),
+        (_CURRENCY_BEFORE, "a currency symbol before"),
+    ):
+        if um := rx.search(f.template):
+            problems.append(
+                Problem(
+                    "V4",
+                    f"template puts {what} a placeholder ({um.group(0)!r})",
+                    "values are displayed with their own unit and scale; write just {n}",
                     f.pos,
                 )
             )

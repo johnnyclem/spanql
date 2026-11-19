@@ -9,6 +9,7 @@ Env overrides use ``SPANQL_<SECTION>__<KEY>`` (double underscore), e.g.
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -26,6 +27,16 @@ def data_home() -> Path:
     return base / "spanql"
 
 
+def homebrew_prefix() -> Path | None:
+    """The Homebrew prefix when spanql runs from a Homebrew keg (…/Cellar/spanql/<ver>/…)."""
+    parts = Path(sys.prefix).resolve().parts
+    if "Cellar" in parts:
+        i = len(parts) - 1 - parts[::-1].index("Cellar")
+        if i + 1 < len(parts) and parts[i + 1] == "spanql":
+            return Path(*parts[:i])
+    return None
+
+
 def config_home() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
@@ -36,6 +47,10 @@ def config_home() -> Path:
 class ServerConfig:
     bind: str = f"127.0.0.1:{DEFAULT_PORT}"
     api_token: str | None = None
+    # Explicit opt-in to serve a non-loopback bind without a token. Only for setups where
+    # the network boundary is enforced elsewhere, e.g. a container whose port is published
+    # on the host's 127.0.0.1 only (see compose.yaml).
+    allow_unauthenticated: bool = False
 
     @property
     def host(self) -> str:
@@ -164,7 +179,11 @@ def _build_section(cls: type, raw: dict[str, Any], section: str) -> Any:
 def default_config_path() -> Path | None:
     if env := os.environ.get("SPANQL_CONFIG"):
         return Path(env).expanduser()
-    for cand in (Path("spanql.toml"), config_home() / "config.toml"):
+    brew = homebrew_prefix()
+    cands = [Path("spanql.toml"), config_home() / "config.toml"]
+    if brew is not None:
+        cands.append(brew / "etc" / "spanql" / "config.toml")
+    for cand in cands:
         if cand.exists():
             return cand
     return None
@@ -208,7 +227,11 @@ def load_config(path: str | Path | None = None, *, env: dict[str, str] | None = 
         )
     if token := env.get("SPANQL_API_TOKEN"):
         cfg.server.api_token = token
-    if not cfg.server.is_loopback and not cfg.server.api_token:
+    if (
+        not cfg.server.is_loopback
+        and not cfg.server.api_token
+        and not cfg.server.allow_unauthenticated
+    ):
         raise ConfigError(
             f"server.bind={cfg.server.bind} is not loopback; set SPANQL_API_TOKEN to enable auth"
         )

@@ -278,3 +278,17 @@ def test_saved_cells_have_trace(demo_store: Store) -> None:
     out = ev(demo_store, GROWTH, Q3, Q2, save=True)
     stored = demo_store.get_cell(out.cells[0]["id"])
     assert stored is not None and stored["formula"].startswith("DIFF(")
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["{0} million in revenue", "revenue was ${0}", "{0}% growth", "{0} dollars"],
+)
+def test_v4_template_cannot_add_units(demo_store: Store, template: str) -> None:
+    out = ev(demo_store, f'ANSWER(MONEY($1."$4.82 million"), text:"{template}")', Q3)
+    assert "V4" in codes(out), out.problems
+
+
+def test_template_prose_after_placeholder_ok(demo_store: Store) -> None:
+    out = ev(demo_store, 'ANSWER(MONEY($1."$4.82 million"), text:"{0} in Q3 revenue (Kept)")', Q3)
+    assert out.status == "grounded", out.problems

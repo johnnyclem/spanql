@@ -94,3 +94,14 @@ def test_gc_backup(db: list[str], tmp_path: Path, capsys) -> None:
     assert main([*db, "gc", "--retention-days", "0"]) == 0
     assert main([*db, "backup", str(tmp_path / "bk.db")]) == 0
     assert (tmp_path / "bk.db").exists()
+
+
+def test_global_options_after_subcommand(tmp_path: Path, demo_dir: Path, capsys) -> None:
+    db = str(tmp_path / "after.db")
+    assert main(["ingest", str(demo_dir), "--db", db, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["added"] == 7
+    assert main(["--db", db, "sources", "--json"]) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 7
+    cfg = tmp_path / "c.toml"
+    assert main(["init", "--config", str(cfg)]) == 0
+    assert cfg.exists()
