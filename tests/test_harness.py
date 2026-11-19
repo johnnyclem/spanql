@@ -72,8 +72,24 @@ def test_backend_error_is_reported(demo_store: Store) -> None:
             raise BackendError("model endpoint unreachable")
 
     res = Harness(demo_store, Down([])).ask("What was Q3 revenue?")
-    assert res.status == "not_found"
-    assert "unreachable" in (res.reason or res.answer)
+    # an outage is an error, never a "not in your sources" refusal
+    assert res.status == "error" and res.refusal_by is None
+    assert "unreachable" in (res.error or "")
+    assert "couldn't find" not in res.answer and "says nothing about your sources" in res.answer
+    assert res.to_dict()["error"] == "model endpoint unreachable"
+
+
+def test_backend_error_on_retry_is_still_an_error(demo_store: Store) -> None:
+    class FlakyThenDown(ScriptedBackend):
+        def generate(self, *a, **kw):
+            if self.calls:
+                raise BackendError("model endpoint error 500")
+            return super().generate(*a, **kw)
+
+    res = Harness(demo_store, FlakyThenDown(['ANSWER(MONEY($1."nope"))'])).ask(
+        "What was Q3 revenue?"
+    )
+    assert res.status == "error" and len(res.attempts) == 1
 
 
 def test_relevance_check_wires_through(demo_store: Store) -> None:

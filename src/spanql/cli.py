@@ -213,6 +213,9 @@ def _print_answer(res: Any, as_json: bool) -> None:
     if as_json:
         _print_json(res.to_dict())
         return
+    if res.status == "error":
+        print(f"error: {res.answer}", file=sys.stderr)
+        return
     print(res.answer)
     if res.status == "grounded":
         _print_cells(res.cells)
@@ -226,7 +229,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
     svc = _services(args)
     res = svc.ask(args.question, scope=args.scope)
     _print_answer(res, args.json)
-    return 0
+    return 2 if res.status == "error" else 0
 
 
 def cmd_chat(args: argparse.Namespace) -> int:

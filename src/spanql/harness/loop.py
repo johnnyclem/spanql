@@ -42,7 +42,7 @@ class Attempt:
 class AskResult:
     run_id: str
     question: str
-    status: str  # grounded | not_found | ambiguous
+    status: str  # grounded | not_found | ambiguous | error (the backend failed; no answer)
     answer: str
     cells: list[dict[str, Any]] = field(default_factory=list)
     formula: str | None = None
@@ -54,6 +54,7 @@ class AskResult:
     conflicting: list[str] = field(default_factory=list)
     model: dict[str, Any] = field(default_factory=dict)
     seconds: float = 0.0
+    error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +73,7 @@ class AskResult:
             "conflicting": self.conflicting,
             "model": self.model,
             "seconds": round(self.seconds, 3),
+            "error": self.error,
         }
 
 
@@ -244,8 +246,18 @@ class Harness:
                 **base,
             )
         if backend_error:
-            reason = f"the model backend failed: {backend_error}"
-        elif attempts:
+            # an unreachable or broken model is an operational error, not "the answer isn't in
+            # your sources": reporting it as a refusal would make an outage look like a fact
+            return AskResult(
+                status="error",
+                answer=f"No answer: the model backend failed ({backend_error}). "
+                "This says nothing about your sources; check the model endpoint and retry.",
+                formula=attempts[-1].formula if attempts else None,
+                reason=f"model backend failed: {backend_error}",
+                error=backend_error,
+                **base,
+            )
+        if attempts:
             last = attempts[-1].problems
             reason = (
                 f"no formula passed verification after {len(attempts)} attempt(s); last "

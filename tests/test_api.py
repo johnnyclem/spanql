@@ -134,3 +134,19 @@ def test_token_auth(services: Services) -> None:
 def test_unknown_cell_and_span(client: TestClient) -> None:
     assert client.get("/v1/cells/c_nope").status_code == 404
     assert client.get("/v1/spans/sp:zz").status_code in (400, 404)
+
+
+def test_backend_outage_is_503_not_a_refusal(services: Services) -> None:
+    from spanql.harness.backends import BackendError, ScriptedBackend
+
+    class Down(ScriptedBackend):
+        def generate(self, *a, **kw):
+            raise BackendError("model endpoint unreachable (test)")
+
+    services.harness.backend = Down([])
+    client = TestClient(create_app(services))
+    r = client.post("/v1/ask", json={"question": "What was Q3 revenue?"})
+    assert r.status_code == 503
+    assert r.json()["status"] == "error" and "unreachable" in r.json()["error"]
+    r = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Q3?"}]})
+    assert r.status_code == 503 and r.json()["error"]["type"] == "backend_error"

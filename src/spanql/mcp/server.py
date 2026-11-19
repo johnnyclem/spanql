@@ -128,6 +128,12 @@ class MCPServer:
             if name == "ask":
                 data: Any = svc.ask(str(args["question"]), scope=args.get("scope")).to_dict()
                 text = data["answer"]["text"]
+                if data["status"] == "error":
+                    return {
+                        "content": [{"type": "text", "text": f"error: {text}"}],
+                        "structuredContent": data,
+                        "isError": True,
+                    }
             elif name == "search":
                 data = svc.search(
                     str(args["query"]), scope=args.get("scope"), k=int(args.get("k", 10))

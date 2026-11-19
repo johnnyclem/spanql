@@ -105,3 +105,13 @@ def test_global_options_after_subcommand(tmp_path: Path, demo_dir: Path, capsys)
     cfg = tmp_path / "c.toml"
     assert main(["init", "--config", str(cfg)]) == 0
     assert cfg.exists()
+
+
+def test_ask_with_unreachable_model_exits_nonzero(tmp_path: Path, demo_dir: Path, capsys) -> None:
+    base = ["--db", str(tmp_path / "down.db"), "--backend", "llama.cpp"]
+    base += ["--endpoint", "http://127.0.0.1:9/v1"]
+    assert main([*base, "ingest", str(demo_dir)]) == 0
+    capsys.readouterr()
+    assert main([*base, "ask", "What was Q3 revenue?"]) == 2
+    io = capsys.readouterr()
+    assert "model backend failed" in io.err and "couldn't find" not in io.out + io.err

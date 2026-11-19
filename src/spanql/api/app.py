@@ -169,7 +169,8 @@ def create_app(svc: Services) -> Starlette:
         res = await run_sync(svc.ask, q, scope=scope, conversation_id=conv)
         out = res.to_dict()
         metrics.observe(out)
-        return JSONResponse(out)
+        # a failed model backend is a 503, never a 200 "not found"
+        return JSONResponse(out, status_code=503 if out["status"] == "error" else 200)
 
     def _ask_stream(q: str, scope: list[str] | None, conv: str | None) -> StreamingResponse:
         loop = asyncio.get_running_loop()
@@ -286,6 +287,11 @@ def create_app(svc: Services) -> Starlette:
         res = await run_sync(svc.ask, q, conversation_id=body.get("user"))
         out = res.to_dict()
         metrics.observe(out)
+        if out["status"] == "error":
+            return JSONResponse(
+                {"error": {"message": out["answer"]["text"], "type": "backend_error"}},
+                status_code=503,
+            )
         text = _chat_text(out)
         cid = "chatcmpl-" + uuid.uuid4().hex[:16]
         created = int(time.time())
