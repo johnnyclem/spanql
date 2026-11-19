@@ -46,6 +46,8 @@ RULES:
 - Never type a number that isn't in a quote; numbers in formulas are only allowed for
   places:, filters, query arguments, and numbers the user typed in the question.
   Never put digits in text:"..." outside {n}.
+- Values render with their own unit, currency and scale ($510,000, 11.8%): write "{0}", not
+  "{0}%", "${0}" or "{0} million".
 - Quote the smallest exact span that contains the value, e.g. $3."$4.82 million".
 - Use FIND/COLUMN/SYMBOLS for counts and totals over many lines or rows.
 - If no candidate actually answers the question, write NOT_FOUND(...). Do not guess.

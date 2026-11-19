@@ -111,10 +111,23 @@ def check_literals(f: Formula, question: str | None = None) -> tuple[list[Proble
 
 # values are rendered with their own unit/currency/scale; prose must not add another one
 _UNIT_AFTER = re.compile(
-    r"\{\d+\}\s*(million|billion|thousand|trillion|percent|per cent|%|dollars?|euros?|pounds?"
+    r"\{\d+\}\s*(million|billion|thousand|trillion|dollars?|euros?|pounds?"
     r"|USD|EUR|GBP|k|K|M|MM|bn|B)(?![A-Za-z])"
 )
-_CURRENCY_BEFORE = re.compile(r"[$€£¥₹]\s*\{\d+\}")
+# "{0}%" and "${0}" are tolerated when they repeat the value's own unit (checked after
+# evaluation by normalize_template, which then drops the duplicate)
+_PCT_AFTER = re.compile(r"\{(\d+)\}(\s*(?:%|percent\b|per cent\b))")
+_CURRENCY_BEFORE = re.compile(r"(US\$|C\$|A\$|[$€£¥₹])\s*\{(\d+)\}")
+_SYMBOL_CODES = {
+    "$": "USD",
+    "US$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+    "₹": "INR",
+    "C$": "CAD",
+    "A$": "AUD",
+}
 _QNUM = re.compile(r"\d[\d,.:/\-]*\d|\d")
 
 
@@ -135,10 +148,7 @@ def check_template(f: Formula, question: str | None = None) -> list[Problem]:
                     f.pos,
                 )
             )
-    for rx, what in (
-        (_UNIT_AFTER, "a unit or scale word after"),
-        (_CURRENCY_BEFORE, "a currency symbol before"),
-    ):
+    for rx, what in ((_UNIT_AFTER, "a unit or scale word after"),):
         if um := rx.search(f.template):
             problems.append(
                 Problem(
@@ -164,3 +174,51 @@ def check_template(f: Formula, question: str | None = None) -> list[Problem]:
             )
         )
     return problems
+
+
+def normalize_template(
+    template: str | None, units: list[str | None]
+) -> tuple[str | None, list[Problem]]:
+    """Resolve ``{n}%`` / ``{n} percent`` / ``${n}`` against the evaluated values' units.
+
+    Values render with their own unit, so a ``%`` after a percentage (or ``$`` before a USD
+    amount) is a harmless duplicate: it is dropped so the answer doesn't read "11.8%%". The same
+    decoration on a value of another unit is a claim the sources don't support (V4)."""
+    if template is None:
+        return None, []
+    problems: list[Problem] = []
+
+    def unit_of(i: int) -> str | None:
+        return units[i] if 0 <= i < len(units) else None
+
+    def pct(m: re.Match[str]) -> str:
+        i = int(m.group(1))
+        if unit_of(i) == "%":
+            return "{" + m.group(1) + "}"
+        problems.append(
+            Problem(
+                "V4",
+                f"template puts a percent sign after {{{i}}}, but that value is not a "
+                f"percentage (unit: {unit_of(i) or 'none'})",
+                "compute it with PCT(part, whole) or drop the %; values render with their own unit",
+            )
+        )
+        return m.group(0)
+
+    def cur(m: re.Match[str]) -> str:
+        i, code = int(m.group(2)), _SYMBOL_CODES[m.group(1)]
+        if unit_of(i) == code:
+            return "{" + m.group(2) + "}"
+        problems.append(
+            Problem(
+                "V4",
+                f"template puts {m.group(1)} before {{{i}}}, but that value is not {code} "
+                f"(unit: {unit_of(i) or 'none'})",
+                "use MONEY(...) on a quote that states the currency, or write just {n}",
+            )
+        )
+        return m.group(0)
+
+    out = _PCT_AFTER.sub(pct, template)
+    out = _CURRENCY_BEFORE.sub(cur, out)
+    return out, problems

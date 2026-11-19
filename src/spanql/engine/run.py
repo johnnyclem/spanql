@@ -30,7 +30,12 @@ from spanql.formula.ast import (
 from spanql.formula.ast import HandleRef as HRef
 from spanql.formula.parser import FormulaSyntaxError, parse
 from spanql.store.db import SpanError, Store, now_iso
-from spanql.verify.checks import check_literals, check_template, is_count_question
+from spanql.verify.checks import (
+    check_literals,
+    check_template,
+    is_count_question,
+    normalize_template,
+)
 
 Relevance = Callable[[str, str], bool]  # (question, span text) -> relevant?
 _PLACEHOLDER = re.compile(r"\{(\d+)\}")
@@ -170,6 +175,8 @@ def evaluate_formula(
             )
         if val.type == "SpanSet":
             problems.append(Problem("V1", "an answer can't be a bare set of matches", pos=expr.pos))
+    template, unit_problems = normalize_template(f.template, [v.unit for v in values])
+    problems += unit_problems
 
     if relevance is not None and question and not problems:
         checked: set[str] = set()
@@ -218,7 +225,7 @@ def evaluate_formula(
         cells.append(cell)
         if save:
             store.save_cell(cell, question_id)
-    answer = render(f.template, values)
+    answer = render(template, values)
     return Outcome(
         "grounded", canonical, cells=cells, answer=answer, warnings=warnings, queries=ctx.queries
     )

@@ -314,7 +314,7 @@ def test_saved_cells_have_trace(demo_store: Store) -> None:
 
 @pytest.mark.parametrize(
     "template",
-    ["{0} million in revenue", "revenue was ${0}", "{0}% growth", "{0} dollars"],
+    ["{0} million in revenue", "revenue was €{0}", "{0}% growth", "{0} percent", "{0} dollars"],
 )
 def test_v4_template_cannot_add_units(demo_store: Store, template: str) -> None:
     out = ev(demo_store, f'ANSWER(MONEY($1."$4.82 million"), text:"{template}")', Q3)
@@ -378,3 +378,29 @@ def test_arg_refs_in_answer(demo_store: Store) -> None:
 def test_arg_ref_forward_is_v1(demo_store: Store) -> None:
     out = ev(demo_store, 'ANSWER(PCT([1], [1]), MONEY($1."$4.82 million"))', Q3)
     assert out.status == "error" and codes(out) == ["V1"]
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("Revenue grew {0}%.", "Revenue grew 11.8%."),
+        ("Revenue grew {0} percent.", "Revenue grew 11.8%."),
+        ("Revenue grew {0}.", "Revenue grew 11.8%."),
+    ],
+)
+def test_percent_after_a_percentage_is_not_doubled(
+    demo_store: Store, template: str, expected: str
+) -> None:
+    f = (
+        'ANSWER(PCT(DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M")), MONEY($2."$4.31M"), '
+        f'places:1), text:"{template}")'
+    )
+    out = ev(demo_store, f, Q3, Q2)
+    assert out.status == "grounded", out.problems
+    assert out.answer == expected
+
+
+def test_currency_symbol_before_matching_amount_is_not_doubled(demo_store: Store) -> None:
+    out = ev(demo_store, 'ANSWER(MONEY($1."$4.82 million"), text:"Revenue was ${0}.")', Q3)
+    assert out.status == "grounded", out.problems
+    assert out.answer == "Revenue was $4,820,000."
