@@ -22,6 +22,7 @@ REFERENCES (all data must come from these):
   $n."words"#2       the 2nd occurrence of that substring
   FIND(...)          a query over all sources, for counting and aggregating
   [c_id]             a previously computed cell
+  [0], [1]           an earlier value of this same ANSWER (0-based), e.g. PCT([0], [1], places:1)
 
 FUNCTIONS:
   extract: NUM MONEY PCT_OF DATE DATETIME DURATION TEXT BOOL   e.g. MONEY($1."$4.82 million")
@@ -43,7 +44,8 @@ FUNCTIONS:
 
 RULES:
 - Never type a number that isn't in a quote; numbers in formulas are only allowed for
-  places:, filters and query arguments. Never put digits in text:"..." outside {n}.
+  places:, filters, query arguments, and numbers the user typed in the question.
+  Never put digits in text:"..." outside {n}.
 - Quote the smallest exact span that contains the value, e.g. $3."$4.82 million".
 - Use FIND/COLUMN/SYMBOLS for counts and totals over many lines or rows.
 - If no candidate actually answers the question, write NOT_FOUND(...). Do not guess.
@@ -64,7 +66,7 @@ CANDIDATES:
 [$2] wiki/q2.md · L9
      Revenue in Q2 came to $6.5M.
 QUESTION: How much did revenue grow from Q2 to Q3?
-ANSWER(DIFF(MONEY($1."$7.1M"), MONEY($2."$6.5M")), PCT(DIFF(MONEY($1."$7.1M"), MONEY($2."$6.5M")), MONEY($2."$6.5M"), places:1), text:"Revenue grew by {0} ({1}).")
+ANSWER(DIFF(MONEY($1."$7.1M"), MONEY($2."$6.5M")), PCT([0], MONEY($2."$6.5M"), places:1), text:"Revenue grew by {0} ({1}).")
 
 Example 3
 CANDIDATES:

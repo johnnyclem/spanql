@@ -1,6 +1,8 @@
 from spanql.formula.ast import (
     Ambiguous,
     Answer,
+    ArgRef,
+    ArgRefError,
     BinOp,
     BoolLit,
     Call,
@@ -13,6 +15,7 @@ from spanql.formula.ast import (
     NotFound,
     NumberLit,
     StringLit,
+    expand_arg_refs,
     unparse,
 )
 from spanql.formula.parser import FormulaSyntaxError, parse
@@ -20,6 +23,8 @@ from spanql.formula.parser import FormulaSyntaxError, parse
 __all__ = [
     "Ambiguous",
     "Answer",
+    "ArgRef",
+    "ArgRefError",
     "BinOp",
     "BoolLit",
     "Call",
@@ -33,6 +38,7 @@ __all__ = [
     "NotFound",
     "NumberLit",
     "StringLit",
+    "expand_arg_refs",
     "parse",
     "unparse",
 ]

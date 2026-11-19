@@ -6,6 +6,7 @@ from spanql.engine.errors import Problem
 from spanql.formula.ast import (
     Ambiguous,
     Answer,
+    ArgRef,
     BinOp,
     BoolLit,
     Call,
@@ -68,7 +69,7 @@ class TypeChecker:
                 return "Text"
             case BoolLit():
                 return "Bool"
-            case CellRef():
+            case CellRef() | ArgRef():
                 return ANY
             case Neg(operand=o):
                 self.numeric(o, "'-'")

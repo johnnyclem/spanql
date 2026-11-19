@@ -17,7 +17,16 @@ from spanql.engine.evaluator import EvalContext, Evaluator
 from spanql.engine.handles import HandleTable
 from spanql.engine.typecheck import typecheck
 from spanql.engine.values import Value, display
-from spanql.formula.ast import Ambiguous, Answer, Formula, NotFound, unparse, walk
+from spanql.formula.ast import (
+    Ambiguous,
+    Answer,
+    ArgRefError,
+    Formula,
+    NotFound,
+    expand_arg_refs,
+    unparse,
+    walk,
+)
 from spanql.formula.ast import HandleRef as HRef
 from spanql.formula.parser import FormulaSyntaxError, parse
 from spanql.store.db import SpanError, Store, now_iso
@@ -124,6 +133,10 @@ def evaluate_formula(
         )
 
     assert isinstance(f, Answer)
+    try:
+        f = expand_arg_refs(f)  # [n] -> the n-th earlier value; each cell stays self-contained
+    except ArgRefError as exc:
+        return Outcome("error", canonical, problems=[Problem("V1", exc.message, pos=exc.pos)])
     problems = typecheck(f)
     lit_err, warnings = check_literals(f, question)
     problems += lit_err + check_template(f, question)

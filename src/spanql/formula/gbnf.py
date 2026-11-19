@@ -54,6 +54,7 @@ def build_gbnf(handles: list[int] | range, *, allow_cellrefs: bool = True) -> st
         'bool ::= "TRUE" | "FALSE"',
     ]
     if allow_cellrefs:
-        lines.append('cellref ::= "[" [a-zA-Z_] [a-zA-Z0-9_]* "]"')
+        # [c_id] references a stored cell; [n] an earlier value of the same ANSWER
+        lines.append('cellref ::= "[" ( [a-zA-Z_] [a-zA-Z0-9_]* | [0-9] [0-9]? ) "]"')
     lines.append(r"ws ::= ( [ \t\n] [ \t]* )?")
     return "\n".join(lines) + "\n"

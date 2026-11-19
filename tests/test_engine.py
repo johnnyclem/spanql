@@ -357,3 +357,24 @@ def test_v5_typo_suggestion_names_the_right_source(demo_store: Store) -> None:
         question="How many?",
     )
     assert ok.status == "grounded" and ok.cells[0]["value"]["decimal"] == "0"
+
+
+def test_arg_refs_in_answer(demo_store: Store) -> None:
+    f = (
+        'ANSWER(COUNT(FIND(src:"demo/logs/*.log", match:"PaymentTimeout")), '
+        'COUNT(FIND(src:"demo/logs/*.log", level:"ERROR")), PCT([0], [1], places:1), '
+        'text:"{0} of {1} errors ({2}) were timeouts.")'
+    )
+    out = ev(demo_store, f, question="What share of errors were payment timeouts?")
+    assert out.status == "grounded", out.problems
+    assert "PCT([0], [1], places:1)" in out.formula  # the formula as written
+    pct = out.cells[2]
+    assert pct["formula"].startswith("PCT(COUNT(FIND(")  # the cell is self-contained
+    assert pct["value"]["unit"] == "%"
+    n, d = (c["value"]["decimal"] for c in out.cells[:2])
+    assert out.answer == f"{n} of {d} errors ({pct['value']['display']}) were timeouts."
+
+
+def test_arg_ref_forward_is_v1(demo_store: Store) -> None:
+    out = ev(demo_store, 'ANSWER(PCT([1], [1]), MONEY($1."$4.82 million"))', Q3)
+    assert out.status == "error" and codes(out) == ["V1"]

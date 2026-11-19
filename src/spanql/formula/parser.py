@@ -15,7 +15,7 @@ Grammar (EBNF; see docs/ARCHITECTURE.md §2.3, plus comparisons which FIND predi
     call     = FNAME "(" [ arg { "," arg } ] ")" ;
     arg      = ident ":" cmp | cmp ;
     hlist    = "[" "$" int { "," "$" int } "]" ;
-    cellref  = "[" ident "]" ;
+    cellref  = "[" ident "]" | "[" int "]" ;   (* stored cell | earlier ANSWER value *)
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from decimal import Decimal
 from spanql.formula.ast import (
     Ambiguous,
     Answer,
+    ArgRef,
     BinOp,
     BoolLit,
     Call,
@@ -312,6 +313,12 @@ class Parser:
             return node
         if t.kind == "op" and t.text == "[":
             self.i += 1
+            if self.cur.kind == "num":
+                num = self.eat("num")
+                if not str(num.text).isdigit():
+                    raise self.err("[n] needs a whole number, e.g. [0]")
+                self.eat("op", "]")
+                return ArgRef(int(str(num.text)), pos=t.pos)
             ident = self.eat("ident")
             self.eat("op", "]")
             return CellRef(ident.text, pos=t.pos)

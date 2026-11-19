@@ -153,3 +153,39 @@ def test_grammar_accepts_unparsed_asts(es: list[A.Node]) -> None:
     text = A.unparse(A.Answer(tuple(es), None))
     g = Grammar(build_gbnf(range(1, 31)))
     assert g.accepts(text), text
+
+
+def test_arg_refs_parse_and_unparse() -> None:
+    from spanql.formula.ast import ArgRef, walk
+
+    f = parse('ANSWER(COUNT(FIND(match:"a")), COUNT(FIND(match:"b")), PCT([0], [1], places:1))')
+    refs = [n for n in walk(f) if isinstance(n, ArgRef)]
+    assert [r.index for r in refs] == [0, 1]
+    assert "PCT([0], [1], places:1)" in A.unparse(f)
+    assert parse(A.unparse(f)) == f
+
+
+def test_arg_refs_expand_to_self_contained_values() -> None:
+    from spanql.formula.ast import Answer, ArgRef, expand_arg_refs, walk
+
+    f = parse("ANSWER(MONEY($1), MONEY($2), DIFF([0], [1]), PCT([2], [1], places:1))")
+    assert isinstance(f, Answer)
+    g = expand_arg_refs(f)
+    assert not any(isinstance(n, ArgRef) for n in walk(g))
+    assert A.unparse(g.exprs[3]) == "PCT(DIFF(MONEY($1), MONEY($2)), MONEY($2), places:1)"
+
+
+@pytest.mark.parametrize(
+    "formula", ["ANSWER([0])", "ANSWER(MONEY($1), [1])", "ANSWER(MONEY($1), PCT([2], [0]))"]
+)
+def test_arg_refs_must_point_backwards(formula: str) -> None:
+    from spanql.formula.ast import Answer, ArgRefError, expand_arg_refs
+
+    f = parse(formula)
+    assert isinstance(f, Answer)
+    with pytest.raises(ArgRefError):
+        expand_arg_refs(f)
+
+
+def test_grammar_accepts_arg_refs(grammar5: Grammar) -> None:
+    assert grammar5.accepts('ANSWER(MONEY($1."x"), MONEY($2."y"), PCT([0], [1], places:1))')

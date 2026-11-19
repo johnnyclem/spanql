@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
 
@@ -39,6 +39,14 @@ class HandleRef(Node):
 @dataclass(frozen=True)
 class CellRef(Node):
     cell_id: str
+
+
+@dataclass(frozen=True)
+class ArgRef(Node):
+    """``[n]``: the value of the n-th (0-based) earlier expression of the same ``ANSWER``,
+    so ``PCT([0], [1])`` doesn't repeat two long ``COUNT(FIND(...))`` expressions."""
+
+    index: int
 
 
 @dataclass(frozen=True)
@@ -118,6 +126,8 @@ def unparse(node: Node) -> str:
             return s
         case CellRef(cell_id=c):
             return f"[{c}]"
+        case ArgRef(index=i):
+            return f"[{i}]"
         case Call(name=n, args=a, kwargs=k):
             parts = [unparse(x) for x in a] + [f"{kn}:{unparse(kv)}" for kn, kv in k]
             return f"{n}({', '.join(parts)})"
@@ -172,3 +182,52 @@ def walk(node: Node) -> Iterator[Node]:
         case Answer(exprs=e):
             for x in e:
                 yield from walk(x)
+
+
+class ArgRefError(ValueError):
+    def __init__(self, message: str, pos: int):
+        super().__init__(message)
+        self.message = message
+        self.pos = pos
+
+
+def _subst(node: Node, done: list[Node], current: int) -> Node:
+    match node:
+        case ArgRef(index=i):
+            if i >= current:
+                raise ArgRefError(
+                    f"[{i}] in value {current} must refer to an earlier value "
+                    f"(use [0]..[{current - 1}])"
+                    if current
+                    else "[n] can't be used in the first value of ANSWER",
+                    node.pos,
+                )
+            return done[i]
+        case Call(args=a, kwargs=k):
+            return replace(
+                node,
+                args=tuple(_subst(x, done, current) for x in a),
+                kwargs=tuple((kn, _subst(kv, done, current)) for kn, kv in k),
+            )
+        case BinOp(left=left, right=right):
+            return replace(
+                node, left=_subst(left, done, current), right=_subst(right, done, current)
+            )
+        case Compare(left=left, right=right):
+            return replace(
+                node, left=_subst(left, done, current), right=_subst(right, done, current)
+            )
+        case Neg(operand=o):
+            return replace(node, operand=_subst(o, done, current))
+    return node
+
+
+def expand_arg_refs(answer: Answer) -> Answer:
+    """Replace every ``[n]`` with the expression it names, so each value (and each stored cell)
+    is a self-contained formula. Raises :class:`ArgRefError` for forward or self references."""
+    if not any(isinstance(n, ArgRef) for n in walk(answer)):
+        return answer
+    done: list[Node] = []
+    for i, e in enumerate(answer.exprs):
+        done.append(_subst(e, done, i))
+    return replace(answer, exprs=tuple(done))
