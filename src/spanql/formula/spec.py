@@ -32,8 +32,3 @@ ANSWER_KWARGS = ("text",)
 
 FORMS = ("ANSWER", "NOT_FOUND", "AMBIGUOUS")
 CMP_OPS = ("==", "!=", ">=", "<=", ">", "<")
-
-# Numeric literals that are tolerated (with a warning) outside formatting/query contexts.
-OBVIOUS_CONSTANTS = frozenset(
-    {"0", "1", "2", "7", "10", "12", "24", "52", "60", "100", "365", "1000", "3600", "86400"}
-)

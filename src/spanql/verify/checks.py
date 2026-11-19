@@ -15,7 +15,7 @@ from spanql.formula.ast import (
     Node,
     NumberLit,
 )
-from spanql.formula.spec import OBVIOUS_CONSTANTS, QUERY_FUNCTIONS
+from spanql.formula.spec import QUERY_FUNCTIONS
 
 _PLACEHOLDER = re.compile(r"\{(\d+)\}")
 _COUNT_Q = re.compile(r"(?i)\b(how many|how often|count|number of|times|occurrences|instances)\b")
@@ -25,37 +25,63 @@ def is_count_question(question: str | None) -> bool:
     return question is None or bool(_COUNT_Q.search(question))
 
 
-def check_literals(f: Formula) -> tuple[list[Problem], list[Problem]]:
-    """V4: numeric literals may appear only as formatting/config parameters (keyword args,
-    ROUND's places), inside query filters, or as obvious constants (which are flagged)."""
+# a number standing on its own: "3 times", "1,000", "2.5"; not the 3 in "Q3" or "v3"
+_QTOKEN = re.compile(r"(?<![A-Za-z_\d.,])\d[\d,]*(?:\.\d+)?(?![A-Za-z_\d])")
+
+
+def question_numbers(question: str | None) -> frozenset[str]:
+    """Numbers the user typed in the question, normalized (``1,000`` → ``1000``, ``3.0`` → ``3``).
+
+    A number the user wrote is the user's own input ("what is 3 times …", "top 5"), not a value
+    the model made up, so V4 lets the formula use it."""
+    if not question:
+        return frozenset()
+    return frozenset(_norm_num(m.group(0)) for m in _QTOKEN.finditer(question))
+
+
+def _norm_num(text: str) -> str:
+    t = text.replace(",", "").lstrip("-")
+    if "." in t:
+        t = t.rstrip("0").rstrip(".")
+    return t.lstrip("0") or "0"
+
+
+def check_literals(f: Formula, question: str | None = None) -> tuple[list[Problem], list[Problem]]:
+    """V4: a numeric literal is allowed only as a formatting/config parameter (keyword args,
+    ROUND's places), inside a query filter, or when the user typed that number in the question.
+    Anything else is an ungrounded value and is rejected; there is no "obvious constant"
+    allowance (``MONEY($1) * 2`` would otherwise produce a grounded-looking value)."""
     errors: list[Problem] = []
     warnings: list[Problem] = []
     if not isinstance(f, Answer):
         return errors, warnings
+    from_question = question_numbers(question)
 
     def visit(node: Node, allowed: bool) -> None:
         match node:
             case NumberLit(text=t):
                 if allowed:
                     return
-                if t.lstrip("-") in OBVIOUS_CONSTANTS:
+                if _norm_num(t) in from_question:
                     warnings.append(
                         Problem(
                             "V4",
-                            f"constant {t} is not from your sources",
-                            "flagged as an obvious constant",
+                            f"number {t} is taken from the question",
+                            "allowed because the user typed it",
                             node.pos,
                         )
                     )
-                else:
-                    errors.append(
-                        Problem(
-                            "V4",
-                            f"numeric literal {t} is not from your sources",
-                            "every value must come from a $n quote or a FIND(...) query",
-                            node.pos,
-                        )
+                    return
+                errors.append(
+                    Problem(
+                        "V4",
+                        f"numeric literal {t} is not from your sources or the question",
+                        "every value must come from a $n quote or a FIND(...) query; "
+                        "only formatting (places:), query filters and numbers typed in the "
+                        "question may be written as literals",
+                        node.pos,
                     )
+                )
             case Call(name=name, args=args, kwargs=kwargs):
                 in_query = name in QUERY_FUNCTIONS or name == "FIELD"
                 for i, a in enumerate(args):

@@ -125,7 +125,7 @@ def evaluate_formula(
 
     assert isinstance(f, Answer)
     problems = typecheck(f)
-    lit_err, warnings = check_literals(f)
+    lit_err, warnings = check_literals(f, question)
     problems += lit_err + check_template(f, question)
     if problems:
         return Outcome("error", canonical, problems=problems, warnings=warnings)

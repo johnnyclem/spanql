@@ -131,8 +131,38 @@ def test_v4_ungrounded_values(demo_store: Store, formula: str) -> None:
 def test_v4_allows_query_and_formatting_numbers(demo_store: Store) -> None:
     out = ev(demo_store, 'ANSWER(ROUND(MONEY($1."$4.82 million"), places:2))', Q3)
     assert out.status == "grounded"
-    out = ev(demo_store, 'ANSWER(MONEY($1."$4.82 million") / 1000)', Q3)
-    assert out.status == "grounded" and out.warnings  # obvious constant flagged
+    out = ev(demo_store, 'ANSWER(COUNT(FIND(src:"demo/logs/*.log", FIELD("status") >= 500)))')
+    assert out.status == "grounded", out.problems
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        'ANSWER(MONEY($1."$4.82 million") * 2)',
+        'ANSWER(MONEY($1."$4.82 million") / 1000)',
+        'ANSWER(IF(MONEY($1."$4.82 million") > MONEY($1."$4.82 million"), '
+        'MONEY($1."$4.82 million"), MONEY($1."$4.82 million") * 2))',
+    ],
+)
+def test_v4_no_obvious_constant_allowance(demo_store: Store, formula: str) -> None:
+    out = ev(demo_store, formula, Q3, question="What was Q3 revenue?")
+    assert out.status == "error" and "V4" in codes(out), out.problems
+
+
+def test_v4_allows_numbers_typed_in_the_question(demo_store: Store) -> None:
+    f = 'ANSWER(MONEY($1."$4.82 million") * 3)'
+    out = ev(demo_store, f, Q3, question="What is 3 times Q3 revenue?")
+    assert out.status == "grounded", out.problems
+    assert out.cells[0]["value"]["decimal"].startswith("14460000")
+    assert out.warnings  # recorded on the cell as coming from the question
+    assert ev(demo_store, f, Q3, question="What is Q3 revenue?").status == "error"
+    out = ev(
+        demo_store,
+        'ANSWER(MONEY($1."$4.82 million") / 1000)',
+        Q3,
+        question="What is Q3 revenue in thousands (divide by 1,000)?",
+    )
+    assert out.status == "grounded", out.problems
 
 
 def test_v4_template_allows_numbers_from_question(demo_store: Store) -> None:
@@ -269,8 +299,10 @@ def test_ratio_avg_abs(demo_store: Store) -> None:
 def test_cellref(demo_store: Store) -> None:
     first = ev(demo_store, 'ANSWER(MONEY($1."$4.82 million"))', Q3, save=True)
     cid = first.cells[0]["id"]
-    out = evaluate_formula(demo_store, f"ANSWER(ROUND([{cid}] / 1000, places:0))", {})
+    f = f"ANSWER(ROUND([{cid}] / 1000, places:0))"
+    out = evaluate_formula(demo_store, f, {}, question="What is that in thousands (/ 1000)?")
     assert out.status == "grounded", out.problems
+    assert evaluate_formula(demo_store, f, {}).status == "error"  # 1000 is not from anywhere
     assert out.cells[0]["value"]["display"] == "$4,820"
 
 
