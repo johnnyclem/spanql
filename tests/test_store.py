@@ -188,3 +188,24 @@ def test_cells_and_runs_roundtrip(demo_store: Store) -> None:
     assert demo_store.get_run("r_1") == {"a": 1}
     assert demo_store.list_runs()[0]["id"] == "r_1"
     assert demo_store.get_cell("nope") is None
+
+
+def test_reanchor_finds_a_value_edited_in_place(store: Store, tmp_path: Path) -> None:
+    root = tmp_path / "fin"
+    f = write(root / "t.md", "# Finance\n\nQ2 revenue was $4.31M. Q3 revenue was $4.82 million.\n")
+    src = [SourceConfig(path=str(root))]
+    ingest_all(store, src)
+    old = _span_of(store, "fin/t.md", "$4.31M")
+    q3 = _span_of(store, "fin/t.md", "$4.82 million")
+    # insert a paragraph above and edit the value itself
+    f.write_text(
+        "# Finance\n\nNew intro.\n\nQ2 revenue was $4.35M. Q3 revenue was $4.82 million.\n"
+    )
+    ingest_all(store, src)
+    ra = reanchor(store, old)
+    assert ra.status == "changed" and ra.method == "anchors", ra
+    assert ra.new_text == "$4.35M"
+    assert ra.new and store.resolve(ra.new).text == "$4.35M"
+    # the untouched neighbour is still found exactly
+    ra3 = reanchor(store, q3)
+    assert ra3.status == "moved" and ra3.new_text == "$4.82 million"

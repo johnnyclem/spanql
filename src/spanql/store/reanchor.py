@@ -22,6 +22,7 @@ class Reanchor:
     new: str | None = None
     ratio: float | None = None
     new_text: str | None = None
+    method: str | None = None  # context | exact | anchors | fuzzy
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -30,6 +31,7 @@ class Reanchor:
             "new": self.new,
             "ratio": self.ratio,
             "new_text": self.new_text,
+            "method": self.method,
         }
 
 
@@ -65,16 +67,28 @@ def reanchor(store: Store, span: Span | str) -> Reanchor:
         s = with_ctx[0] + len(before)
         new = Span(cur_id, s, s + len(needle))
         status = "unchanged" if s == old.start else "moved"
-        return Reanchor(status, old.id, new.id, 1.0, needle.decode("utf-8", "replace"))
+        return Reanchor(status, old.id, new.id, 1.0, needle.decode("utf-8", "replace"), "context")
     exact = _find_all(new_data, needle)
     if len(exact) == 1:
         new = Span(cur_id, exact[0], exact[0] + len(needle))
-        return Reanchor("moved", old.id, new.id, 1.0, needle.decode("utf-8", "replace"))
+        return Reanchor("moved", old.id, new.id, 1.0, needle.decode("utf-8", "replace"), "exact")
     if len(exact) > 1:
         # pick the occurrence nearest the old offset (deterministic), report as moved
         s = min(exact, key=lambda x: (abs(x - old.start), x))
         new = Span(cur_id, s, s + len(needle))
-        return Reanchor("moved", old.id, new.id, 1.0, needle.decode("utf-8", "replace"))
+        return Reanchor("moved", old.id, new.id, 1.0, needle.decode("utf-8", "replace"), "exact")
+
+    # edited in place: the text on both sides is intact, the value between them changed
+    if (hit := _between_anchors(needle, before, after, new_data)) is not None:
+        s, e, r = hit
+        return Reanchor(
+            "changed",
+            old.id,
+            Span(cur_id, s, e).id,
+            round(r, 3),
+            new_data[s:e].decode("utf-8", "replace"),
+            "anchors",
+        )
 
     # fuzzy: best matching line window of the same line count near the old position
     old_text = needle.decode("utf-8", "replace")
@@ -95,6 +109,43 @@ def reanchor(store: Store, span: Span | str) -> Reanchor:
         e = min(e, len(new_data))
         new = Span(cur_id, s, e)
         return Reanchor(
-            "changed", old.id, new.id, round(best[0], 3), new_data[s:e].decode("utf-8", "replace")
+            "changed",
+            old.id,
+            new.id,
+            round(best[0], 3),
+            new_data[s:e].decode("utf-8", "replace"),
+            "fuzzy",
         )
     return Reanchor("missing", old.id, ratio=round(best[0], 3))
+
+
+def _between_anchors(
+    text: bytes, before: bytes, after: bytes, new: bytes
+) -> tuple[int, int, float] | None:
+    """Locate an edited value by the unchanged bytes on both sides of it.
+
+    Tries progressively shorter anchors (32, 16, 8 bytes) taken right next to the old span;
+    the candidate is what now sits between them, if it is still similar to the old text
+    (ratio ≥ 0.5) and not wildly longer. Picks the most similar candidate; ties go to the
+    earliest position, so the result is deterministic."""
+    if not before or not after:
+        return None
+    old = text.decode("utf-8", "replace")
+    for k in (32, 16, 8):
+        b, a = before[-k:], after[:k]
+        if len(b) < min(k, 8) or len(a) < min(k, 8):
+            continue
+        best: tuple[int, int, float] | None = None
+        for bp in _find_all(new, b)[:50]:
+            lo = bp + len(b)
+            window = new[lo : lo + 2 * len(text) + 64]
+            ap = window.find(a)
+            if ap <= 0:
+                continue
+            cand = new[lo : lo + ap].decode("utf-8", "replace")
+            ratio = difflib.SequenceMatcher(None, old, cand, autojunk=False).ratio()
+            if ratio >= 0.5 and (best is None or ratio > best[2]):
+                best = (lo, lo + ap, ratio)
+        if best:
+            return best
+    return None
