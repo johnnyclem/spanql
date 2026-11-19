@@ -117,20 +117,30 @@ def _free_port() -> int:
 def test_managed_runtime_spawns_supervises_and_stops(tmp_path: Path) -> None:
     import sys
 
+    # a /bin/sh wrapper (not a python shebang, which macOS handles differently for venv
+    # interpreters) that runs the fake server and keeps its stderr for diagnostics
+    script = tmp_path / "fake_server.py"
+    script.write_text(FAKE_SERVER)
+    log = tmp_path / "fake_server.log"
     binary = tmp_path / "llama-server"
-    binary.write_text(FAKE_SERVER.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
+    binary.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@" 2>>"{log}"\n')
     binary.chmod(0o755)
+
+    def why() -> str:
+        code = rt.proc.poll() if rt.proc else None
+        return f"exit={code} restarts={rt.restarts} log={log.read_text() if log.exists() else ''!r}"
+
     (tmp_path / "m.gguf").write_bytes(b"GGUF")
     cfg = Config(model=ModelConfig(model=str(tmp_path / "m.gguf"), llama_server_bin=str(binary)))
     rt = ManagedLlamaServer(cfg, port=_free_port())
     assert rt.available() == (True, "ok")
     rt.start()
     try:
-        assert rt.wait_ready(timeout=15)
+        assert rt.wait_ready(timeout=15), why()
         assert rt.proc is not None
         rt.proc.kill()  # crash -> supervisor restarts it
         rt.proc.wait()
-        assert rt.wait_ready(timeout=15)
+        assert rt.wait_ready(timeout=15), why()
         import time
 
         deadline = time.monotonic() + 10
