@@ -1,4 +1,3 @@
-from .dates import date_hints
-from .retriever import Candidate, Retrieval, extract_terms, retrieve
+from spanql.retrieve.retriever import Retrieval, Retriever
 
-__all__ = ["retrieve", "Retrieval", "Candidate", "extract_terms", "date_hints"]
+__all__ = ["Retrieval", "Retriever"]

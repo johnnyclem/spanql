@@ -8,3 +8,4 @@
 | [0004](0004-python-core-external-model-runtime.md) | Python core; model served by a separate OpenAI-compatible runtime | Proposed |
 | [0005](0005-docker-and-homebrew-packaging.md) | Docker image and Homebrew service; weights downloaded at runtime | Proposed |
 | [0006](0006-refusal-is-a-first-class-answer.md) | Refusal is a first-class, evaluated outcome | Proposed |
+| [0007](0007-implementation-deviations.md) | Deviations from the design made during the first implementation | Proposed |

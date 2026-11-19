@@ -1,3 +1,1 @@
-from .pipeline import IngestReport, convert, ingest_path
-
-__all__ = ["IngestReport", "convert", "ingest_path"]
+"""Ingestion: discover sources, convert to canonical text, segment into blocks, store."""

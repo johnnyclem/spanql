@@ -1,3 +1,5 @@
-from .cli import main
+import sys
 
-raise SystemExit(main())
+from spanql.cli import main
+
+sys.exit(main())

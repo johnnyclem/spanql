@@ -1,6 +1,6 @@
 # ADR-0006: Refusal ("not found in your sources") is a first-class, evaluated outcome
 
-- Status: Proposed
+- Status: Proposed (implemented on `feat/implementation`; deviations in [ADR-0007](0007-implementation-deviations.md))
 - Date: 2026-11-17
 
 ## Context

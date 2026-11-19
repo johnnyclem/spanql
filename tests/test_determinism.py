@@ -1,74 +1,101 @@
-"""Property-style determinism tests (roadmap M2 exit criterion): the same formula
-over the same snapshots yields the same value, trace and display, regardless of
-evaluation order, database row ids, or ingestion order."""
+"""Property-style determinism check (roadmap M2 exit criterion, ported from PR #1): the same
+formula over the same sources yields the same value, cells, trace and display, regardless of
+repetition, database row ids or ingestion order."""
 
 from __future__ import annotations
 
 import json
 import random
+from pathlib import Path
+from typing import Any
 
-from conftest import block_span, write_corpus
-from spanql.engine import Engine, HandleTable
-from spanql.errors import SpanqlError
-from spanql.ingest import ingest_path
-from spanql.store import Store
+from spanql.config import SourceConfig
+from spanql.engine.run import evaluate_formula
+from spanql.ingest.pipeline import ingest_all
+from spanql.store.db import Store
 
-GLOBS = ['"logs/*"', '"logs/payments-*.log"', '"logs/api/*.log"', '"logs/jobs.jsonl"', '"data/*"', '"reports/*.md"',
-         '"repo/**/*.py"']
-REGEXES = ['"ERROR"', '"Timeout"', '"user=[a-d]"', '"\\\\d{3}"', '"revenue"', '"job failed"', '"def "']
-EXTRA = ['', ', day:"2026-11-10"', ', level:"error"', ', kind:"log"', ', FIELD("status") >= 400',
-         ', FIELD("units") > 3', ', since:"2026-11-10T09:00:03Z"']
+from .helpers import handles
+
+GLOBS = ['"logs/*"', '"logs/payments-*.log"', '"*.log"', '"reports/*.md"', '"repo/**"', '"data/*"']
+REGEXES = ['"ERROR"', '"Timeout"', '"order=A1\\\\d\\\\d"', '"\\\\d{3}"', '"revenue"', '"def "']
+EXTRA = ["", ', day:"2026-11-10"', ', level:"ERROR"', ', kind:"log"', ', FIELD("status") >= 500']
+COLS = ['"amount"', '"customer"']
+REGION = ["", ', FIELD("region") == "West"']
 CATALOG = [
-    lambda r: f'COUNT(FIND(src:{r.choice(GLOBS)}, re:{r.choice(REGEXES)}{r.choice(EXTRA)}))',
-    lambda r: f'COUNT(FIND(src:{r.choice(GLOBS)}{r.choice(EXTRA)}))',
-    lambda r: f'PCT(COUNT(FIND(src:"logs/*", re:{r.choice(REGEXES)})), COUNT(FIND(src:"logs/*")), places:{r.randint(0, 3)})',
-    lambda r: f'{r.choice(["SUM", "AVG", "MIN", "MAX"])}(COLUMN("units", src:"data/sales.csv"{r.choice(EXTRA[:1] + [", FIELD(\"region\") == \"EMEA\""])}))',
-    lambda r: 'DISTINCT(SYMBOLS(src:"repo/**/*.py", kind:"function", calls:"retry_with_backoff"))',
-    lambda r: f'COUNT(SYMBOLS(src:"repo/**/*.py", kind:{r.choice(["\"function\"", "\"method\"", "\"class\"", "\"module\""])}))',
+    lambda r: f"COUNT(FIND(src:{r.choice(GLOBS)}, re:{r.choice(REGEXES)}{r.choice(EXTRA)}))",
+    lambda r: f"COUNT(FIND(src:{r.choice(GLOBS)}{r.choice(EXTRA)}))",
+    lambda r: (
+        f'COUNT(FIND(src:{r.choice(GLOBS)}, match:"{r.choice(["revenue", "PaymentTimeout", "retry"])}"))'
+    ),
+    lambda r: (
+        f'PCT(COUNT(FIND(src:"logs/*", re:{r.choice(REGEXES)})), COUNT(FIND(src:"logs/*")), '
+        f"places:{r.randint(0, 3)})"
+    ),
+    lambda r: (
+        f'{r.choice(["SUM", "AVG", "MIN", "MAX"])}(COLUMN(src:"data/invoices.csv", "amount"'
+        f"{r.choice(REGION)}))"
+    ),
+    lambda r: f'COUNT(DISTINCT(COLUMN(src:"data/invoices.csv", {r.choice(COLS)})))',
+    lambda r: (
+        f'COUNT(SYMBOLS(src:"repo/**", kind:"{r.choice(["function", "method", "class", "function|method"])}"))'
+    ),
+    lambda r: (
+        'DISTINCT(SYMBOLS(src:"repo/**", kind:"function|method", calls:"retry_with_backoff"))'
+    ),
     lambda r: 'DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M"))',
-    lambda r: 'PCT(DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M")), MONEY($2."$4.31M"), places:1)',
-    lambda r: 'DAYS_BETWEEN(DATE($3."2026-03-01"), DATE($3."March 15, 2026"))',
-    lambda r: f'FIND(src:{r.choice(GLOBS)}, re:{r.choice(REGEXES)})',
+    lambda r: (
+        'PCT(DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M")), MONEY($2."$4.31M"), places:1)'
+    ),
+    lambda r: f'ROUND(MONEY($1."$4.82 million"), places:{r.randint(0, 2)})',
 ]
 
 
-def make_store(corpus, order):
-    s = Store(":memory:")
-    for sub in order:
-        ingest_path(s, str(corpus / sub))
-    return s
+def _store(path: Path, demo_dir: Path, order: list[str]) -> Store:
+    st = Store(path)
+    rep = ingest_all(st, [SourceConfig(path=str(demo_dir / sub)) for sub in order])
+    assert not rep.errors
+    return st
 
 
-def handles(s):
-    return HandleTable({
-        1: block_span(s, "reports/q3-2026.md", "Total revenue"),
-        2: block_span(s, "reports/q2-2026.md", "Q2 revenue"),
-        3: block_span(s, "reports/q2-2026.md", "The invoice was issued"),
-    })
+def _outcome(store: Store, formula: str) -> tuple[Any, ...]:
+    hs = handles(store, ("reports/q3-2026.md", "$4.82 million"), ("reports/q2-2026.md", "$4.31M"))
+    out = evaluate_formula(store, f"ANSWER({formula})", hs, question="How many?")
+    if out.status != "grounded":  # errors must be deterministic too
+        return ("error", tuple((p.code, p.message) for p in out.problems))
+    return (
+        "ok",
+        out.answer,
+        tuple(
+            (
+                c["id"],
+                c["formula"],
+                json.dumps(c["value"], sort_keys=True),
+                json.dumps([(s["op"], s["out"]) for s in c["steps"]]),
+                json.dumps(
+                    [
+                        i.get("count") if i["kind"] == "query" else i.get("consumed")
+                        for i in c["inputs"]
+                    ]
+                ),
+            )
+            for c in out.cells
+        ),
+    )
 
 
-def outcome(engine, formula, h):
+def test_same_formula_same_result_across_stores_and_runs(tmp_path: Path, demo_dir: Path) -> None:
+    a = _store(tmp_path / "a.db", demo_dir, ["logs", "reports", "data", "repo"])
+    b = _store(tmp_path / "b.db", demo_dir, ["repo", "data", "reports", "logs"])  # other row ids
+    rng = random.Random(20261119)
+    ok = 0
     try:
-        ev = engine.evaluate(formula, h)
-    except SpanqlError as e:  # errors must be deterministic too
-        return ("error", e.check, e.message)
-    return ("ok", [(c.display, json.dumps(c.to_json()["value"], sort_keys=True),
-                    [(s["op"], s["out"]) for s in c.steps],
-                    [i.get("count") if i["kind"] == "query" else i.get("consumed") for i in c.inputs]) for c in ev.cells])
-
-
-def test_same_formula_same_result_across_stores_and_runs(tmp_path):
-    corpus = write_corpus(tmp_path / "c")
-    a = make_store(corpus, ["logs", "reports", "data", "repo"])
-    b = make_store(corpus, ["repo", "data", "reports", "logs"])  # different ingestion order => different row ids
-    ea, eb = Engine(a), Engine(b)
-    ha, hb = handles(a), handles(b)
-    rng = random.Random(20261118)
-    checked_ok = 0
-    for _ in range(300):
-        f = rng.choice(CATALOG)(rng)
-        first = outcome(ea, f, ha)
-        assert first == outcome(ea, f, ha), f  # repeat on the same store
-        assert first == outcome(eb, f, hb), f  # and on an independently built store
-        checked_ok += first[0] == "ok"
-    assert checked_ok > 150  # the generator mostly exercises successful evaluations
+        for _ in range(250):
+            f = rng.choice(CATALOG)(rng)
+            first = _outcome(a, f)
+            assert first == _outcome(a, f), f  # repeat on the same store
+            assert first == _outcome(b, f), f  # and on an independently built store
+            ok += first[0] == "ok"
+    finally:
+        a.close()
+        b.close()
+    assert ok > 150, ok  # the generator mostly exercises successful evaluations

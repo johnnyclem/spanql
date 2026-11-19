@@ -1,4 +1,4 @@
-"""Neutral data model shared by segmenters (ingest) and the writer (store)."""
+"""Small shared data types."""
 
 from __future__ import annotations
 
@@ -6,32 +6,29 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass(slots=True)
-class Block:
-    """A retrieval unit: a span plus optional typed side data.
+@dataclass
+class BlockSpec:
+    """A block produced by a converter/segmenter, addressed by canonical byte offsets."""
 
-    ``parent``/``cell['row']`` are indexes into the same block list; the writer
-    turns them into block ids.
-    """
-
-    kind: str  # paragraph|heading|list_item|code_block|log_record|table_row|table_cell|line|chunk|module|class|function|method
+    kind: str
     start: int
     end: int
     path: str | None = None
     page: int | None = None
-    is_unit: bool = False  # the default counting unit for FIND
-    fts: str | None = None  # text to index in FTS5 (None = not indexed)
-    record: dict[str, Any] | None = None  # log_record side data
-    row: dict[str, Any] | None = None  # table_row side data
-    cell: dict[str, Any] | None = None  # table_cell side data
-    symbol: dict[str, Any] | None = None  # code_symbol side data
+    log: dict[str, Any] | None = None  # ts, level, logger, message_start, message_end, fields
+    row: dict[str, Any] | None = None  # table_id, row, fields
+    cell: dict[str, Any] | None = None  # table_id, row, col, header, row_index (index into blocks)
+    symbol: dict[str, Any] | None = None  # lang, kind, name, qualified_name, parent_index, calls
+    index_text: bool = True  # include in FTS
+    fts_text: str | None = None  # override indexed text (e.g. "header: value" for rows)
 
 
-@dataclass(slots=True)
-class Document:
-    """Result of converting + segmenting one source file."""
+@dataclass
+class Converted:
+    """Output of a converter: canonical text, offset map and blocks."""
 
-    data: bytes  # canonical UTF-8 text
-    blocks: list[Block] = field(default_factory=list)
-    segmentation: str = "text@1"
-    offset_map: bytes | None = None
+    text: str
+    blocks: list[BlockSpec]
+    converter: str
+    offset_map: list[tuple[int, int]] | None = None  # (canonical line start, raw byte offset)
+    meta: dict[str, Any] = field(default_factory=dict)

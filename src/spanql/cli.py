@@ -1,471 +1,669 @@
-"""The ``spanql`` command line."""
+"""The ``spanql`` command."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import shutil
 import sys
 import tempfile
-import urllib.request
 from pathlib import Path
+from typing import Any
 
-from . import __version__
-from .config import Config, ConfigError, load_config
-from .engine import Engine
-from .engine.recompute import recompute
-from .errors import SpanqlError, StoreError
-from .formula.gbnf import build_gbnf
-from .harness import Harness, HarnessError, evaluate_formula, list_runs
-from .ingest import ingest_path
-from .store import Store, collect_garbage, describe_sources, reanchor
+from spanql import __version__
+from spanql.config import Config, ConfigError, SourceConfig, load_config, render_default_config
 
 
-def _out(text: str = "") -> None:
-    print(text)
+def _print_json(obj: Any) -> None:
+    print(json.dumps(obj, indent=2, default=str, ensure_ascii=False))
 
 
-def _err(text: str) -> None:
-    print(text, file=sys.stderr)
+def _load(args: argparse.Namespace) -> Config:
+    cfg = load_config(args.config)
+    if getattr(args, "db", None):
+        cfg.store.path = args.db
+    if getattr(args, "backend", None):
+        cfg.model.backend = args.backend
+    if getattr(args, "endpoint", None):
+        cfg.model.endpoint = args.endpoint
+    if getattr(args, "model", None):
+        cfg.model.model = args.model
+    return cfg
 
 
-def _clip(s: str, n: int) -> str:
-    s = " ".join(str(s).split())
-    return s if len(s) <= n else s[: n - 1] + "…"
+def _services(args: argparse.Namespace) -> Any:
+    from spanql.services import Services
+
+    return Services.create(_load(args))
 
 
-# ----------------------------------------------------------- presentation
+# ------------------------------------------------------------------- commands
+def cmd_init(args: argparse.Namespace) -> int:
+    from spanql.config import config_home, data_home, homebrew_prefix
 
-
-def _cell_sources(c: dict, limit: int = 3) -> list[str]:
-    lines: list[str] = []
-    for inp in c.get("inputs", [])[:limit]:
-        if inp["kind"] == "span":
-            what = f"«{inp['consumed']}»" if inp.get("consumed") else f'"{_clip(inp["text"], 60)}"'
-            lines.append(f"{inp.get('source')}:L{inp.get('line')}  {what}")
-        elif inp["kind"] == "query":
-            q = inp["query"]
-            where = f" in {inp['matched_sources']} source(s)" if inp.get("matched_sources") else ""
-            first = inp["sample"][0] if inp.get("sample") else None
-            lines.append(f"{inp['count']} match(es){where} · {q.get('op')} {q.get('src', '')}"
-                         + (f" · first: {first}" if first else ""))
-        else:
-            lines.append(f"from cell {inp['id']}")
-    extra = len(c.get("inputs", [])) - limit
-    if extra > 0:
-        lines.append(f"… and {extra} more input(s); see `spanql trace {c['id']}`")
-    return lines
-
-
-def format_cells(cells: list[dict]) -> str:
-    out = []
-    for c in cells:
-        out.append(f"  [{c['index']}] {_clip(c['display'], 60)}   = {_clip(c['formula'], 110)}")
-        out += [f"        → {line}" for line in _cell_sources(c)]
-        out.append(f"        · {c['id']}")
-    return "\n".join(out)
-
-
-def format_ask(res) -> str:
-    parts = [res.text]
-    if res.cells:
-        parts += ["", format_cells(res.cells)]
-    foot = f"\n[{res.status} · {res.attempts} attempt(s) · {res.elapsed_ms} ms · run {res.run_id}]"
-    return "\n".join(parts) + foot
-
-
-def format_trace(c: dict, stale: list[dict]) -> str:
-    out = [f"{c['id']}  =  {c['formula']}", f"value     {c['display']}   ({c['type']})",
-           f"computed  {c['evaluated_at']} · engine {c['engine_version']}"
-           + (f" · model {c['model']['id']} attempt {c['model']['formula_attempt']}" if c.get("model") else "")]
-    out.append("status    " + ("fresh" if not stale else "STALE: " + "; ".join(f"{s['reason']} ({s.get('source') or s.get('op') or s.get('id')})" for s in stale)))
-    out += ["", "steps:"]
-    for i, s in enumerate(c["steps"], 1):
-        extra = f"   [consumed: {s['in']}]" if s.get("in") else ""
-        out.append(f"  {i}. {_clip(s['expr'], 90)}  →  {s['out']}{extra}")
-    out += ["", "inputs:"]
-    for inp in c["inputs"]:
-        if inp["kind"] == "span":
-            loc = f"{inp.get('source')} L{inp.get('line')}" + (f" · {inp['path']}" if inp.get("path") else "")
-            out.append(f"  span {inp['id']}  {loc}  snapshot {inp['snapshot'][:12]}")
-            text = inp["text"]
-            if inp.get("consumed") and inp["consumed"] in text:
-                text = text.replace(inp["consumed"], f"«{inp['consumed']}»", 1)
-            out.append(f"      {text}")
-            for u in inp.get("uses", []):
-                out.append(f"      {u['op']} read «{u['consumed']}» → {json.dumps(u['parsed'])}")
-        elif inp["kind"] == "query":
-            out.append(f"  query {json.dumps(inp['query'])}")
-            out.append(f"      {inp['count']} match(es) of {inp['blocks_searched']} blocks in {inp['matched_sources']} source(s)")
-            for uri, snap in sorted(inp["snapshots"].items())[:8]:
-                out.append(f"      {uri}  snapshot {snap[:12]}")
-            if inp.get("sample"):
-                out.append("      first contributing spans: " + ", ".join(inp["sample"][:5])
-                           + (" …" if inp.get("truncated") else ""))
-        else:
-            out.append(f"  cell {inp['id']}")
-    return "\n".join(out)
-
-
-# --------------------------------------------------------------- commands
-
-
-def cmd_ingest(args, cfg: Config) -> int:
-    targets: list[dict] = [{"path": p, "kind": args.kind, "name": args.name} for p in args.paths]
-    if not targets:
-        targets = [dict(s) for s in cfg.sources]
-        if not targets:
-            _err("nothing to ingest: pass a path or configure [[sources]]")
+    if args.homebrew:
+        brew = homebrew_prefix()
+        if brew is None:
+            print("--homebrew: spanql is not running from a Homebrew keg", file=sys.stderr)
             return 2
-    rc = 0
-    with Store(args.db or cfg.store_path) as store:
-        for t in targets:
-            if t.get("watch"):
-                _err(f"note: watch = true is not implemented yet; {t['path']} was ingested once")
-            try:
-                rep = ingest_path(store, t["path"], kind=t.get("kind"), name=t.get("name"),
-                                  parser=args.parser or t.get("parser", "auto"), force=args.force,
-                                  respect_gitignore=not args.no_gitignore and t.get("respect_gitignore", True),
-                                  year=args.year)
-            except (FileNotFoundError, ValueError) as e:
-                _err(f"error: {e}")
-                rc = 1
-                continue
-            if args.json:
-                _out(json.dumps({"path": t["path"], **rep.to_json()}))
-                continue
-            _out(f"{t['path']}: {len(rep.added)} added, {len(rep.updated)} updated, {rep.unchanged} unchanged, "
-                 f"{len(rep.removed)} removed, {len(rep.skipped)} skipped, {len(rep.errors)} errors")
-            for p, why in rep.skipped[:20]:
-                _out(f"  skipped {p}: {why}")
-            for p, why in rep.errors[:20]:
-                _out(f"  ERROR   {p}: {why}")
-            rc = rc or (1 if rep.errors else 0)
-    return rc
-
-
-def cmd_sources(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        rows = store.list_sources(args.glob)
-        if args.json:
-            _out(json.dumps([{"uri": s.uri, "kind": s.kind, "snapshot": s.current_snapshot} for s in rows]))
-        else:
-            for s in rows:
-                _out(f"{s.kind:5} {s.current_snapshot[:8]}  {s.uri}")
-            _out(f"{len(rows)} source(s)")
+        args.config = args.config or str(brew / "etc" / "spanql" / "config.toml")
+        args.store = args.store or str(brew / "var" / "spanql" / "spanql.db")
+        args.models_dir = args.models_dir or str(brew / "var" / "spanql" / "models")
+        args.runtime = args.runtime or "managed"
+    target = Path(args.config or os.environ.get("SPANQL_CONFIG") or config_home() / "config.toml")
+    target = target.expanduser()
+    if target.exists() and not args.force:
+        print(f"config already exists: {target} (use --force to overwrite)")
+        return 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    runtime = args.runtime or ("managed" if shutil.which("llama-server") else "external")
+    store = Path(args.store).expanduser() if args.store else data_home() / "spanql.db"
+    models = (
+        Path(args.models_dir).expanduser()
+        if args.models_dir
+        else (
+            Path(os.environ["SPANQL_MODELS"])
+            if os.environ.get("SPANQL_MODELS")
+            else data_home() / "models"
+        )
+    )
+    target.write_text(render_default_config(store, models, runtime))
+    print(f"wrote {target}")
+    print(f"  store:   {store}\n  models:  {models}\n  runtime: {runtime}")
+    print(
+        "next: add [[sources]] to the config (or `spanql ingest <path>`), then "
+        "`spanql model pull qwen3.5-4b-instruct-q4_k_m`"
+    )
     return 0
 
 
-def cmd_status(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        st = store.status()
-    m = cfg.data["model"]
-    st["model"] = {"endpoint": m.get("endpoint"), "backend": m.get("backend"), "runtime": m.get("runtime")}
+def cmd_ingest(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    sources = [
+        SourceConfig(path=p, kind=args.kind, name=args.name, parser=args.parser) for p in args.paths
+    ] or None
+    if sources is None and not svc.config.sources:
+        print("no sources: pass paths, or add [[sources]] to the config", file=sys.stderr)
+        return 2
+    rep = svc.ingest(sources)
     if args.json:
-        _out(json.dumps(st, indent=2))
+        _print_json(rep.to_dict())
     else:
-        for k, v in st.items():
-            _out(f"{k:18} {v}")
-    return 0
+        print(
+            f"ingested {', '.join(rep.roots)}: {rep.added} added, {rep.updated} updated, "
+            f"{rep.unchanged} unchanged, {rep.removed} removed, {len(rep.skipped)} skipped, "
+            f"{len(rep.errors)} errors"
+        )
+        for p, e in rep.errors[:20]:
+            print(f"  error {p}: {e}")
+    return 1 if rep.errors and not (rep.added or rep.updated or rep.unchanged) else 0
 
 
-def cmd_describe(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        _out(json.dumps(describe_sources(store, args.glob), indent=2))
-    return 0
-
-
-def cmd_read_span(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        span = store.span_from_id(args.span)
-        info = store.read_span_context(span, args.context)
-        loc = store.locate(span)
-        if args.json:
-            _out(json.dumps({**info, "sources": list(loc.sources), "current": loc.current, "path": loc.path}))
-            return 0
-        _out(f"{info['span']}  {', '.join(loc.sources) or '(unknown source)'}  L{info['line_start']}-L{info['line_end']}"
-             + ("" if loc.current else "  [source has changed since]"))
-        _out(info["context"] if args.context else info["text"])
-    return 0
-
-
-def cmd_reanchor(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        results = reanchor(store, store.span_from_id(args.span))
-        for r in results:
-            _out(json.dumps(r.to_json()) if args.json else
-                 f"{r.status:9} {r.source}  {r.span.id if r.span else '-'}  {r.note}")
-    return 0
-
-
-def _handles(items: list[str]) -> dict[str, str]:
-    out = {}
-    for it in items:
-        k, sep, v = it.partition("=")
-        if not sep:
-            raise ValueError(f"--handle must look like '$1=sp:abcd1234:10:50', got {it!r}")
-        out[k.strip()] = v.strip()
-    return out
-
-
-def cmd_evaluate(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        try:
-            ev = evaluate_formula(store, args.formula, _handles(args.handle), question=args.question,
-                                  verify=not args.no_verify)
-        except SpanqlError as e:
-            _err(e.feedback())
-            return 1
-        if args.json:
-            _out(json.dumps({"kind": ev.kind, "text": ev.render(), "cells": [c.to_json() for c in ev.cells]}, indent=2))
-        else:
-            _out(ev.render())
-            if ev.cells:
-                _out("")
-                _out(format_cells([c.to_json() for c in ev.cells]))
-    return 0
-
-
-def _harness(args, cfg: Config, store: Store) -> Harness:
-    return Harness(store, cfg.make_client(), cfg.harness_config())
-
-
-def cmd_ask(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        res = _harness(args, cfg, store).ask(args.question, scope=args.scope or None)
-        _out(json.dumps(res.to_json(), indent=2, ensure_ascii=False) if args.json else format_ask(res))
-    return 0
-
-
-def cmd_chat(args, cfg: Config) -> int:
-    _out("spanql chat. Ask about your sources; /quit to leave.")
-    with Store(args.db or cfg.store_path) as store:
-        h = _harness(args, cfg, store)
-        while True:
-            try:
-                q = input("you> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                _out()
-                return 0
-            if q in ("/quit", "/exit"):
-                return 0
-            if not q:
-                continue
-            try:
-                _out("\nspanql> " + format_ask(h.ask(q, scope=args.scope or None)).replace("\n", "\n        ") + "\n")
-            except HarnessError as e:
-                _err(f"error: {e}")
-
-
-def cmd_trace(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        c = store.get_cell(args.cell)
-        if c is None:
-            _err(f"no cell {args.cell}")
-            return 1
-        stale = store.staleness(c)
-        _out(json.dumps({**c, "stale": stale}, indent=2) if args.json else format_trace(c, stale))
-    return 0
-
-
-def cmd_recompute(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        try:
-            r = recompute(Engine(store), args.cell)
-        except KeyError:
-            _err(f"no cell {args.cell}")
-            return 1
-        if r.evaluation and r.evaluation.cells:
-            store.save_cells([c.to_json() for c in r.evaluation.cells])
-        if args.json:
-            _out(json.dumps(r.to_json(), indent=2))
-        elif r.status == "ok":
-            _out(r.evaluation.render() + ("   (changed)" if r.changed else "   (unchanged)"))
-            _out(format_cells([c.to_json() for c in r.evaluation.cells]))
-        else:
-            _err("recompute failed: " + (r.error or {}).get("message", "unknown"))
-            return 1
-    return 0
-
-
-def cmd_runs(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        rows = list_runs(store, args.limit)
+def cmd_sources(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    rows = [dict(r) for r in svc.store.list_sources()]
     if args.json:
-        _out(json.dumps(rows))
+        _print_json(rows)
     else:
         for r in rows:
-            _out(f"{r['id']}  {r['created_at']}  {r['status']:9} {r['attempts']} attempt(s) {r['elapsed_ms']:>6} ms  "
-                 f"{_clip(r['question'], 70)}")
+            print(f"{r['kind']:5} {r['uri']}  ({(r['current_snapshot'] or '')[:8]})")
+        print(f"{len(rows)} sources")
     return 0
 
 
-def cmd_gc(args, cfg: Config) -> int:
-    with Store(args.db or cfg.store_path) as store:
-        days = args.days if args.days is not None else int(cfg.data["store"]["snapshot_retention_days"])
-        _out(json.dumps(collect_garbage(store, days)))
+def cmd_status(args: argparse.Namespace) -> int:
+    _print_json(_services(args).status())
     return 0
 
 
-def cmd_grammar(args, cfg: Config) -> int:
-    sys.stdout.write(build_gbnf(args.handles))
+def cmd_read_span(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    out = svc.store.read_with_context(args.span, args.context)
+    if args.json:
+        _print_json(out)
+    else:
+        cur = "" if out["current"] else "  [source changed since this snapshot]"
+        print(f"{out['source']}:L{out['line_start']}-L{out['line_end']}  {out['id']}{cur}")
+        print(out["text"])
     return 0
 
 
-def cmd_serve(args, cfg: Config) -> int:
-    from .api import make_server
-
-    token = os.environ.get("SPANQL_API_TOKEN") or None
-    host, port = cfg.bind()
-    server = make_server(cfg, token=token, host=args.host or host, port=args.port if args.port is not None else port)
-    h, p = server.server_address[:2]
-    _out(f"spanql {__version__} listening on http://{h}:{p}  (store: {cfg.store_path})")
-    if cfg.make_client() is None:
-        _out("note: no model endpoint configured; /v1/ask is unavailable (ingestion and /v1/evaluate still work)")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        _out("\nshutting down")
-    finally:
-        server.server_close()
+def cmd_search(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    r = svc.search(args.query, scope=args.scope, k=args.k)
+    if args.json:
+        _print_json(r.to_dict())
+        return 0
+    for h in r.handles.values():
+        print(f"${h.n}  {h.source} · {h.location()}  {h.span.id}")
+        print("    " + h.text[:300].replace("\n", "\n    "))
+    for hint in r.hints:
+        print(f"  hint: {hint}")
     return 0
 
 
-def cmd_health(args, cfg: Config) -> int:
-    host, port = cfg.bind()
-    host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    try:
-        with urllib.request.urlopen(f"http://{host}:{port}/v1/health", timeout=3) as r:  # noqa: S310
-            ok = json.loads(r.read()).get("status") == "ok"
-    except Exception as e:
-        _err(f"unhealthy: {e}")
+def _print_cells(cells: list[dict[str, Any]]) -> None:
+    for i, c in enumerate(cells, start=1):
+        print(f"  [{i}] {c['value']['display']}  = {c['formula']}   ({c['id']})")
+        for inp in c["inputs"][:5]:
+            if inp["kind"] == "span":
+                where = f"{inp['source']}:L{inp['line']}"
+                shown = inp.get("consumed") or inp["text"]
+                print(
+                    f"        ← {where} · {inp.get('consumed_span') or inp['id']} · {shown[:80]!r}"
+                )
+            elif inp["kind"] == "query":
+                first = f" · first: {inp['first_source']}" if inp.get("first_source") else ""
+                print(f"        ← {inp['count']} matches of {inp['query']}{first}")
+            else:
+                print(f"        ← cell [{inp['id']}]")
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    handles = {}
+    for h in args.handle or []:
+        k, _, v = h.partition("=")
+        handles[k.lstrip("$")] = v
+    out = svc.evaluate(args.formula, handles, question=args.question)
+    if args.json:
+        _print_json(out.to_dict())
+    elif out.status == "grounded":
+        print(out.answer)
+        _print_cells(out.cells)
+    elif out.status in ("not_found", "ambiguous"):
+        print(f"{out.status}: {out.reason}")
+    else:
+        print("rejected by the verifier:")
+        for p in out.problems:
+            print(f"  {p}")
+    return 0 if out.ok else 1
+
+
+def cmd_trace(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    cell = svc.store.get_cell(args.cell)
+    if cell is None:
+        print(f"unknown cell {args.cell}", file=sys.stderr)
         return 1
-    _out("ok" if ok else "unhealthy")
+    if args.json:
+        _print_json({**cell, **svc.staleness(cell)})
+        return 0
+    print(f"{cell['id']} = {cell['value']['display']}  ({cell['status']})")
+    print(f"formula: {cell['formula']}")
+    for h, sid in cell.get("handles", {}).items():
+        print(f"  {h} = {sid}")
+    print("steps:")
+    for s in cell["steps"]:
+        print(f"  {s['op']:<10} → {s['out']}")
+    print("inputs:")
+    _print_cells([cell])
+    st = svc.staleness(cell)
+    if st["stale"]:
+        print(
+            f"source changed for {len(st['stale_inputs'])} input(s); "
+            f"run `spanql recompute {cell['id']}`"
+        )
+    return 0
+
+
+def _print_answer(res: Any, as_json: bool) -> None:
+    if as_json:
+        _print_json(res.to_dict())
+        return
+    if res.status == "error":
+        print(f"error: {res.answer}", file=sys.stderr)
+        return
+    print(res.answer)
+    if res.status == "grounded":
+        _print_cells(res.cells)
+    else:
+        print(f"  ({res.status}; {len(res.attempts)} attempt(s); refused by {res.refusal_by})")
+        for nm in res.search_report.get("near_misses", [])[:3]:
+            print(f"   near miss: {nm['source']} {nm['location']}: {nm['text'][:100]!r}")
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    res = svc.ask(args.question, scope=args.scope)
+    _print_answer(res, args.json)
+    return 2 if res.status == "error" else 0
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    print("spanql chat — ask questions, `:trace <cell>` for provenance, Ctrl-D to quit")
+    while True:
+        try:
+            line = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not line:
+            continue
+        if line.startswith(":trace "):
+            args.cell, args.json = line.split(maxsplit=1)[1], False
+            cmd_trace(args)
+            continue
+        res = svc.ask(line, scope=args.scope, conversation_id="cli")
+        print("spanql> ", end="")
+        _print_answer(res, False)
+
+
+def cmd_recompute(args: argparse.Namespace) -> int:
+    _print_json(_services(args).recompute(args.cell))
+    return 0
+
+
+def cmd_reanchor(args: argparse.Namespace) -> int:
+    from spanql.store.reanchor import reanchor
+
+    _print_json(reanchor(_services(args).store, args.span).to_dict())
+    return 0
+
+
+def cmd_runs(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    if args.run_id:
+        _print_json(svc.store.get_run(args.run_id))
+        return 0
+    for r in svc.store.list_runs(args.limit):
+        print(f"{r['created_at']}  {r['id']}  {r['status']:<10} {r['question']}")
+    return 0
+
+
+def cmd_grammar(args: argparse.Namespace) -> int:
+    from spanql.formula.gbnf import build_gbnf
+
+    print(build_gbnf(range(1, args.handles + 1)), end="")
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    from spanql.api.app import create_app
+    from spanql.runtime import ManagedLlamaServer
+    from spanql.services import Services
+
+    cfg = _load(args)
+    if args.host or args.port:
+        cfg.server.bind = f"{args.host or cfg.server.host}:{args.port or cfg.server.port}"
+        if (
+            not cfg.server.is_loopback
+            and not cfg.server.api_token
+            and not cfg.server.allow_unauthenticated
+        ):
+            print(
+                "refusing to bind a non-loopback address without SPANQL_API_TOKEN", file=sys.stderr
+            )
+            return 2
+    runtime = None
+    if cfg.model.runtime == "managed" and cfg.model.backend in ("llama.cpp", "llamacpp"):
+        runtime = ManagedLlamaServer(cfg)
+        ok, why = runtime.available()
+        if ok:
+            runtime.start()
+            cfg.model.endpoint = runtime.endpoint
+            print(f"started llama-server for {cfg.model.model} on {runtime.endpoint}")
+        else:
+            print(
+                f"model runtime not started: {why}\nserving in 'no model' state "
+                "(ingestion, search and /v1/evaluate still work)"
+            )
+            runtime = None
+    svc = Services.create(cfg)
+    if cfg.sources and not args.no_ingest:
+        rep = svc.ingest()
+        print(f"ingested: {rep.added} added, {rep.updated} updated, {rep.unchanged} unchanged")
+    app = create_app(svc)
+    if not cfg.server.is_loopback and not cfg.server.api_token:
+        print(
+            f"WARNING: {cfg.server.bind} is not loopback and has no API token "
+            "(server.allow_unauthenticated = true); make sure the port is not reachable "
+            "from other machines",
+            file=sys.stderr,
+        )
+    print(f"spanql {__version__} listening on http://{cfg.server.bind}")
+    try:
+        uvicorn.run(app, host=cfg.server.host, port=cfg.server.port, log_level="warning")
+    finally:
+        if runtime:
+            runtime.stop()
+        svc.close()
+    return 0
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    from spanql.mcp.server import MCPServer
+
+    MCPServer(_services(args)).serve()
+    return 0
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    import httpx
+
+    cfg = _load(args)
+    url = args.url or f"http://{cfg.server.bind.replace('0.0.0.0', '127.0.0.1')}/v1/health"
+    try:
+        r = httpx.get(url, timeout=3)
+        ok = r.status_code == 200 and r.json().get("ok")
+    except (httpx.HTTPError, ValueError):
+        ok = False
+    print("ok" if ok else "unhealthy")
     return 0 if ok else 1
 
 
-SELFTEST_FILES = {
-    "docs/q3.md": "# Q3 Report\n\nTotal revenue for the quarter was $4.82 million, up from $4.31 million in Q2.\n",
-    "logs/app.log": ("2026-11-10 09:00:01,100 ERROR app - PaymentTimeout user=a\n"
-                     "2026-11-10 09:00:02,200 INFO app - ok user=b\n"
-                     "2026-11-10 09:00:03,300 ERROR app - PaymentTimeout user=c\n"),
-}
+def cmd_model(args: argparse.Namespace) -> int:
+    from spanql.models import manifest as mf
+
+    cfg = _load(args)
+    if args.model_cmd == "list":
+        have = {m["alias"] for m in mf.installed(cfg.models_dir)}
+        for spec in mf.MANIFEST.values():
+            mark = "*" if spec.alias in have else " "
+            print(
+                f"{mark} {spec.alias:<32} {spec.size / 1e9:5.2f} GB  {spec.license:<11} "
+                f"{spec.repo}  {spec.notes}"
+            )
+        extra = have - set(mf.MANIFEST)
+        for a in sorted(extra):
+            print(f"* {a:<32} (imported)")
+        print(f"models dir: {cfg.models_dir}")
+        return 0
+    if args.model_cmd == "pull":
+        pspec = mf.MANIFEST.get(args.alias)
+        if pspec is None:
+            print(f"unknown alias {args.alias}; see `spanql model list`", file=sys.stderr)
+            return 2
+        print(
+            f"pulling {pspec.alias} ({pspec.size / 1e9:.2f} GB, license {pspec.license}) from "
+            f"{pspec.repo}@{pspec.revision[:10]}"
+        )
+        last = [-1]
+
+        def progress(done: int, total: int) -> None:
+            pct = int(done * 100 / total) if total else 0
+            if pct != last[0] and pct % 5 == 0:
+                last[0] = pct
+                print(f"  {pct}%", flush=True)
+
+        path = mf.pull(args.alias, cfg.models_dir, progress=progress)
+        print(f"ok: {path}")
+        return 0
+    if args.model_cmd == "import":
+        path = mf.import_file(
+            Path(args.file).expanduser(), args.alias, cfg.models_dir, args.license
+        )
+        print(f"imported {path}")
+        return 0
+    return 2
 
 
-def cmd_selftest(args, cfg: Config) -> int:
-    """Ingest a tiny corpus into a throwaway store and evaluate formulas end to end (no model needed)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp) / "corpus"
-        for rel, text in SELFTEST_FILES.items():
-            p = root / rel
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(text, encoding="utf-8")
-        store = Store(":memory:")
-        try:
-            ingest_path(store, str(root / "docs"))
-            ingest_path(store, str(root / "logs"))
-            src = store.get_source("docs/q3.md")
-            data = store.snapshot_bytes(src.current_snapshot)
-            start = data.index(b"Total revenue")
-            span = store.make_span(src.current_snapshot, start, data.index(b"\n", start))
-            ev = evaluate_formula(store, 'ANSWER(MONEY($1."$4.82 million"), COUNT(FIND(src:"logs/*.log", '
-                                         're:"PaymentTimeout")), text:"{0} and {1}")', {"$1": span.id}, save=False)
-            expected = "$4,820,000 and 2"
-            if ev.render() != expected:
-                _err(f"selftest FAILED: expected {expected!r}, got {ev.render()!r}")
-                return 1
-        finally:
-            store.close()
-    _out("ok")
+def cmd_gc(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    n = svc.store.gc_snapshots(
+        args.retention_days
+        if args.retention_days is not None
+        else svc.config.store.snapshot_retention_days
+    )
+    print(f"removed {n} unreferenced old snapshot(s)")
     return 0
 
 
-# ----------------------------------------------------------------- parser
+def cmd_backup(args: argparse.Namespace) -> int:
+    _services(args).store.backup(args.dest)
+    print(f"backed up to {args.dest}")
+    return 0
 
 
-def _add_common(p: argparse.ArgumentParser, *, sub: bool) -> None:
-    """--config/--db/--json work before or after the subcommand (the subparser copy must not clobber)."""
-    d = argparse.SUPPRESS if sub else None
-    p.add_argument("--config", default=d, help="path to config.toml (default: $SPANQL_CONFIG, ./config.toml, ~/.config/spanql/)")
-    p.add_argument("--db", default=d, help="override the store path")
-    p.add_argument("--json", action="store_true", default=argparse.SUPPRESS if sub else False,
-                   help="machine-readable output")
+def cmd_selftest(args: argparse.Namespace) -> int:
+    """Ingest a tiny built-in corpus into a temp store and check every layer offline."""
+    from spanql.config import Config
+    from spanql.harness.backends import FakeBackend, make_backend
+    from spanql.services import Services
+
+    corpus = {
+        "report.md": "# Q3\n\nTotal revenue for the quarter was $4.82 million.\n\n"
+        "Q2 revenue: $4.31M\n",
+        "app.log": "2026-11-10T08:00:05Z ERROR api: PaymentTimeout status=504\n"
+        "2026-11-10T08:01:00Z INFO api: ok status=200\n"
+        "2026-11-10T09:00:05Z ERROR api: PaymentTimeout status=504\n",
+        "data.csv": 'region,amount\nWest,1200.50\nEast,"3,400.00"\n',
+        "lib.py": "def retry(fn):\n    return fn()\n\n\ndef charge():\n    return retry(lambda: 1)\n",
+    }
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "selftest"
+        root.mkdir()
+        for name, text in corpus.items():
+            (root / name).write_text(text)
+        cfg = Config()
+        cfg.store.path = str(Path(tmp) / "st.db")
+        backend = FakeBackend() if args.no_model else make_backend(_load(args).model)
+        svc = Services.create(cfg, backend=backend)
+        rep = svc.ingest([SourceConfig(path=str(root))])
+        checks: list[tuple[str, bool, str]] = [
+            (
+                "ingest",
+                rep.added == 4 and not rep.errors,
+                f"{rep.added} added, {len(rep.errors)} errors",
+            )
+        ]
+        again = svc.ingest([SourceConfig(path=str(root))])
+        checks.append(("re-ingest is a no-op", again.unchanged == 4 and again.added == 0, ""))
+        r = svc.search("revenue quarter")
+        handles = {str(h.n): h.span.id for h in r.handles.values()}
+        q3 = next((str(h.n) for h in r.handles.values() if "4.82" in h.text), None)
+        q2 = next((str(h.n) for h in r.handles.values() if "4.31" in h.text), None)
+        checks.append(("retrieval", bool(q3 and q2), f"{len(handles)} candidates"))
+        if q3 and q2:
+            out = svc.evaluate(
+                f'ANSWER(DIFF(MONEY(${q3}."$4.82 million"), MONEY(${q2}."$4.31M")))', handles
+            )
+            checks.append(("evaluate", out.answer == "$510,000", str(out.answer)))
+            bad = svc.evaluate(f'ANSWER(MONEY(${q3}."$9.99 million"))', handles)
+            checks.append(
+                (
+                    "verifier rejects missing quote",
+                    bad.status == "error",
+                    bad.problems[0].code if bad.problems else "",
+                )
+            )
+        cnt = svc.evaluate('ANSWER(COUNT(FIND(kind:"log", FIELD("status") >= 500)))')
+        checks.append(("log query", cnt.answer == "2", str(cnt.answer)))
+        tot = svc.evaluate('ANSWER(SUM(COLUMN(src:"data.csv", "amount")))')
+        checks.append(("table query", tot.answer == "4,600.5", str(tot.answer)))
+        sym = svc.evaluate('ANSWER(COUNT(SYMBOLS(calls:"retry")))')
+        checks.append(("code query", sym.answer == "1", str(sym.answer)))
+        res = svc.ask("What is the capital of France?")
+        checks.append(("refusal", res.status == "not_found", res.status))
+        if not args.no_model:
+            h = backend.health()
+            checks.append(("model backend", bool(h.get("ok")), json.dumps(h)[:120]))
+            res = svc.ask("How many PaymentTimeout errors were logged on 2026-11-10?")
+            checks.append(("model ask (informational)", True, f"{res.status}: {res.answer}"))
+        svc.close()
+    for name, ok, detail in checks:
+        failures += 0 if ok else 1
+        print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f"  — {detail}" if detail else ""))
+    print("selftest passed" if not failures else f"selftest: {failures} failure(s)")
+    return 0 if not failures else 1
 
 
+# ----------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="spanql", description="Grounded Q&A over docs, logs, files and code.")
+    p = argparse.ArgumentParser(prog="spanql", description=__doc__)
     p.add_argument("--version", action="version", version=f"spanql {__version__}")
-    _add_common(p, sub=False)
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+    p.add_argument(
+        "--config",
+        help="path to config.toml (default: $SPANQL_CONFIG, ./spanql.toml,"
+        " ~/.config/spanql/config.toml)",
+    )
+    p.add_argument("--db", help="override store.path")
+    p.add_argument(
+        "--backend", help="override model.backend (llama.cpp|ollama|openai-compatible|fake)"
+    )
+    p.add_argument("--endpoint", help="override model.endpoint")
+    p.add_argument("--model", help="override model.model")
+    p.add_argument("-v", "--verbose", action="store_true")
+    # the same global options are accepted after the subcommand too
+    # (`spanql serve --config x.toml`, as the Homebrew service block runs it)
+    common = argparse.ArgumentParser(add_help=False)
+    for flag in ("--config", "--db", "--backend", "--endpoint", "--model"):
+        common.add_argument(flag, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    _add = sub.add_parser
 
-    def add(name, fn, help_, **kw):
-        sp = sub.add_parser(name, help=help_, description=help_, **kw)
-        _add_common(sp, sub=True)
-        sp.set_defaults(fn=fn)
-        return sp
+    def add_parser(name: str, **kw: Any) -> argparse.ArgumentParser:
+        return _add(name, parents=[common], **kw)
 
-    s = add("ingest", cmd_ingest, "ingest files, directories, git repos or globs (no-op if unchanged)")
-    s.add_argument("paths", nargs="*", help="paths to ingest (default: the [[sources]] in config)")
-    s.add_argument("--kind", choices=["doc", "log", "file", "code"], help="override the detected kind")
-    s.add_argument("--name", help="URI prefix (default: the directory name)")
-    s.add_argument("--parser", help="log parser: auto, jsonl, nginx, iso, syslog, plain, or re:<regex>")
-    s.add_argument("--year", type=int, help="year for syslog-style timestamps that have none")
-    s.add_argument("--force", action="store_true", help="re-ingest even if the file is unchanged")
-    s.add_argument("--no-gitignore", action="store_true", help="do not use git to decide which files to ingest")
+    sub.add_parser = add_parser  # type: ignore[method-assign]
 
-    s = add("sources", cmd_sources, "list ingested sources")
-    s.add_argument("glob", nargs="?")
-    add("status", cmd_status, "store and model status")
-    s = add("describe", cmd_describe, "show source schemas (log fields, columns, symbols)")
-    s.add_argument("glob", nargs="?")
-    s = add("read-span", cmd_read_span, "print the exact text of a span, with optional context lines")
-    s.add_argument("span", help="sp:<snapshot>:<start>:<end>")
-    s.add_argument("--context", type=int, default=0, help="lines of context on each side")
-    s = add("reanchor", cmd_reanchor, "find where a span's text lives now after its source changed")
+    s = sub.add_parser("init", help="write a default config file")
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--store")
+    s.add_argument("--models-dir")
+    s.add_argument(
+        "--runtime",
+        choices=["managed", "external"],
+        help="model runtime (default: managed if llama-server is on PATH)",
+    )
+    s.add_argument(
+        "--homebrew",
+        action="store_true",
+        help="use Homebrew paths: $(brew --prefix)/etc/spanql and var/spanql (formula post-install)",
+    )
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("ingest", help="ingest paths (or the configured sources)")
+    s.add_argument("paths", nargs="*")
+    s.add_argument("--kind", default="auto", choices=["auto", "doc", "log", "file", "code"])
+    s.add_argument("--name", help="root name used in source URIs")
+    s.add_argument("--parser", default="auto", help="log parser: auto|jsonl|access|syslog|generic")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ingest)
+
+    s = sub.add_parser("sources", help="list ingested sources")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_sources)
+
+    sub.add_parser("status", help="store and model status").set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("read-span", help="print the exact text of a span id")
     s.add_argument("span")
-    s = add("evaluate", cmd_evaluate, "evaluate a hand-written formula (no model)")
-    s.add_argument("formula")
-    s.add_argument("--handle", action="append", default=[], metavar="'$1=SPAN_ID'", help="bind a handle to a span")
-    s.add_argument("--question", help="the question (enables the 'numbers from the question' allowance)")
-    s.add_argument("--no-verify", action="store_true", help="skip the V4 literal policy")
-    s = add("ask", cmd_ask, "ask a question (needs a model endpoint)")
-    s.add_argument("question")
-    s.add_argument("--scope", action="append", help="limit to sources matching this glob (repeatable)")
-    s = add("chat", cmd_chat, "interactive questions (needs a model endpoint)")
+    s.add_argument("--context", type=int, default=0)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_read_span)
+
+    s = sub.add_parser("search", help="full-text search; shows candidate handles")
+    s.add_argument("query")
+    s.add_argument("-k", type=int, default=10)
     s.add_argument("--scope", action="append")
-    s = add("trace", cmd_trace, "show a cell's formula, steps and exact source inputs")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_search)
+
+    s = sub.add_parser("evaluate", help="evaluate a formula (no model)")
+    s.add_argument("formula")
+    s.add_argument("--handle", action="append", help="N=sp:… (repeatable)")
+    s.add_argument("--question")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_evaluate)
+
+    s = sub.add_parser("trace", help="show a cell's provenance")
     s.add_argument("cell")
-    s = add("recompute", cmd_recompute, "re-evaluate a cell against the current sources")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_trace)
+
+    s = sub.add_parser("ask", help="ask a question")
+    s.add_argument("question")
+    s.add_argument("--scope", action="append", help="limit to source globs")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ask)
+
+    s = sub.add_parser("chat", help="interactive REPL")
+    s.add_argument("--scope", action="append")
+    s.set_defaults(fn=cmd_chat)
+
+    s = sub.add_parser("recompute", help="re-evaluate a cell against current sources")
     s.add_argument("cell")
-    s = add("runs", cmd_runs, "recent questions")
+    s.set_defaults(fn=cmd_recompute)
+
+    s = sub.add_parser("reanchor", help="find a span in its source's current snapshot")
+    s.add_argument("span")
+    s.set_defaults(fn=cmd_reanchor)
+
+    s = sub.add_parser("runs", help="list run records (or show one)")
+    s.add_argument("run_id", nargs="?")
     s.add_argument("--limit", type=int, default=20)
-    s = add("gc", cmd_gc, "delete old snapshots that no source or cell uses")
-    s.add_argument("--days", type=int, help="retention in days (default: store.snapshot_retention_days)")
-    s = add("grammar", cmd_grammar, "print the GBNF grammar for N candidate handles")
-    s.add_argument("--handles", type=int, default=8)
-    s = add("serve", cmd_serve, "run the HTTP API")
+    s.set_defaults(fn=cmd_runs)
+
+    s = sub.add_parser("grammar", help="print the GBNF grammar for N handles")
+    s.add_argument("--handles", type=int, default=5)
+    s.set_defaults(fn=cmd_grammar)
+
+    s = sub.add_parser("serve", help="run the HTTP API + web UI")
     s.add_argument("--host")
     s.add_argument("--port", type=int)
-    add("health", cmd_health, "check that a running server is healthy")
-    s = add("selftest", cmd_selftest, "end-to-end check on a throwaway corpus")
-    s.add_argument("--no-model", action="store_true", help="accepted for packaging tests; no model is ever needed")
+    s.add_argument("--no-ingest", action="store_true", help="skip ingesting sources at startup")
+    s.set_defaults(fn=cmd_serve)
+
+    sub.add_parser("mcp", help="run as an MCP server on stdio").set_defaults(fn=cmd_mcp)
+
+    s = sub.add_parser("health", help="check a running server (Docker HEALTHCHECK)")
+    s.add_argument("--url")
+    s.set_defaults(fn=cmd_health)
+
+    s = sub.add_parser("model", help="manage local model weights")
+    msub = s.add_subparsers(dest="model_cmd", required=True)
+    msub.add_parser("list")
+    mp = msub.add_parser("pull")
+    mp.add_argument("alias")
+    mi = msub.add_parser("import")
+    mi.add_argument("file")
+    mi.add_argument("--alias", required=True)
+    mi.add_argument("--license", default="unknown")
+    s.set_defaults(fn=cmd_model)
+
+    s = sub.add_parser("gc", help="delete old unreferenced snapshots")
+    s.add_argument("--retention-days", type=int)
+    s.set_defaults(fn=cmd_gc)
+
+    s = sub.add_parser("backup", help="online backup of the store")
+    s.add_argument("dest")
+    s.set_defaults(fn=cmd_backup)
+
+    s = sub.add_parser("selftest", help="check every layer on a built-in corpus")
+    s.add_argument("--no-model", action="store_true", help="use the offline fake backend")
+    s.set_defaults(fn=cmd_selftest)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     try:
-        cfg = load_config(args.config)
-        return args.fn(args, cfg)
-    except HarnessError as e:
-        _err(f"error: {e}")
+        return int(args.fn(args) or 0)
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
         return 2
-    except (ConfigError, StoreError, ValueError) as e:
-        _err(f"error: {e}")
-        return 2
-    except BrokenPipeError:
-        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        if args.verbose:
+            raise
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

@@ -1,451 +1,556 @@
-"""The span store: one SQLite file holding snapshots, blocks, indexes and cells.
-
-Everything that touches SQL schema lives under ``spanql.store``; the engine only
-talks to this class.
-"""
+"""The SQLite span store: sources, immutable snapshots, blocks, side tables, cells, runs."""
 
 from __future__ import annotations
 
+import bisect
+import hashlib
 import json
 import re
 import sqlite3
 import threading
-import time
-import unicodedata
-from bisect import bisect_right
-from collections import OrderedDict
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import lru_cache
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterator
+from typing import Any
 
-from ..errors import SpanIntegrityError, StoreError
-from ..globs import match_uri
-from ..spans import SNAPSHOT_PREFIX, Span, parse_span_id, sha256_hex
-from .schema import MIGRATIONS, SCHEMA_VERSION
+from spanql.blocks import BlockSpec, Converted
+from spanql.store import saferegex
+from spanql.store.globs import glob_match
+from spanql.store.schema import SCHEMA, SCHEMA_VERSION
 
-DEFAULT_CACHE_BYTES = 256 * 1024 * 1024
-
-
-@dataclass(frozen=True, slots=True)
-class SourceRow:
-    id: int
-    uri: str
-    kind: str
-    root: str | None
-    rel_path: str | None
-    current_snapshot: str | None
+SPAN_RE = re.compile(r"^sp:([0-9a-f]{8,64}):(\d+):(\d+)$")
 
 
-@dataclass(frozen=True, slots=True)
-class Location:
-    """Where a span lives, for display and citation."""
+class SpanError(LookupError):
+    """A span id doesn't resolve, or its bytes don't hash to the recorded value."""
 
-    sources: tuple[str, ...]  # URIs that have (or had) this snapshot, current first
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
+
+
+def _regexp(pattern: str | None, value: Any) -> int:
+    if pattern is None or value is None:
+        return 0
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    try:
+        return 1 if saferegex.search(pattern, str(value)) else 0
+    except saferegex.RegexTimeout:
+        # exceptions can't cross the SQLite callback cleanly; the flag is set and the progress
+        # handler aborts the statement, which the engine reports as a timeout
+        return 0
+
+
+_NUM_RE = re.compile(
+    r"^\s*\(?\s*[-−]?\s*(?:US\$|\$|€|£|¥)?\s*[-−]?\d[\d,]*(?:\.\d+)?\s*%?\s*\)?\s*$"
+)
+
+
+def _progress() -> int:
+    """SQLite progress handler: abort the running statement once the query deadline passed."""
+    return 1 if saferegex.timed_out() or saferegex.expired() else 0
+
+
+def _num(value: Any) -> float | None:
+    """Lenient numeric view of a field value for filter predicates (``FIELD("x") > 5``)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    s = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+    if not _NUM_RE.match(s):
+        return None
+    neg = "-" in s or "−" in s or (s.strip().startswith("(") and s.strip().endswith(")"))
+    digits = re.sub(r"[^\d.]", "", s)
+    try:
+        f = float(digits)
+    except ValueError:
+        return None
+    return -f if neg else f
+
+
+@dataclass(frozen=True)
+class Span:
+    snapshot_id: str
+    start: int
+    end: int
+
+    @property
+    def id(self) -> str:
+        return f"sp:{self.snapshot_id[:8]}:{self.start}:{self.end}"
+
+    @staticmethod
+    def parse(span_id: str) -> tuple[str, int, int]:
+        m = SPAN_RE.match(span_id.strip())
+        if not m:
+            raise SpanError(f"malformed span id: {span_id!r}")
+        start, end = int(m.group(2)), int(m.group(3))
+        if end < start:
+            raise SpanError(f"span end before start: {span_id!r}")
+        return m.group(1), start, end
+
+
+@dataclass
+class ResolvedSpan:
+    span: Span
+    text: str
+    text_sha256: str
+    source_uri: str
+    source_path: str
+    source_kind: str
     line_start: int
     line_end: int
-    block_kind: str | None = None
-    path: str | None = None
+    is_current: bool
     page: int | None = None
-    current: bool = True  # False when every source has moved on to another snapshot
 
+    @property
+    def id(self) -> str:
+        return self.span.id
 
-
-def utc_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-@lru_cache(maxsize=256)
-def _compile(pattern: str) -> re.Pattern[str]:
-    return re.compile(pattern)
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "text_sha256": self.text_sha256,
+            "source": self.source_uri,
+            "path": self.source_path,
+            "kind": self.source_kind,
+            "snapshot": self.span.snapshot_id,
+            "start": self.span.start,
+            "end": self.span.end,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+            "page": self.page,
+            "current": self.is_current,
+        }
 
 
 class Store:
-    """Connection + read APIs. Not shared across threads: open one per thread."""
+    """Thread-safe wrapper around one SQLite file (WAL mode)."""
 
-    def __init__(self, path: str | Path = ":memory:", *, cache_bytes: int = DEFAULT_CACHE_BYTES):
+    def __init__(self, path: str | Path):
         self.path = str(path)
         if self.path != ":memory:":
-            Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-            self.path = str(Path(self.path).expanduser())
-        self.db = sqlite3.connect(self.path, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys=ON")
-        if self.path != ":memory:":
-            self.db.execute("PRAGMA journal_mode=WAL")
-            self.db.execute("PRAGMA synchronous=NORMAL")
-        self._cache: OrderedDict[str, bytes] = OrderedDict()
-        self._cache_bytes = 0
-        self._cache_limit = cache_bytes
-        self._line_index: OrderedDict[str, list[int]] = OrderedDict()
-        self._deadline: float | None = None
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._migrate()
-        self._register_functions()
-
-    # ------------------------------------------------------------------ setup
-
-    def _migrate(self) -> None:
-        cur = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if cur > SCHEMA_VERSION:
-            raise StoreError(
-                f"store schema v{cur} is newer than this spanql (v{SCHEMA_VERSION}); upgrade spanql"
-            )
-        for v in range(cur + 1, SCHEMA_VERSION + 1):
-            try:
-                # executescript with an explicit transaction keeps each migration atomic
-                self.db.executescript(f"BEGIN;\n{MIGRATIONS[v]}\nPRAGMA user_version={v};\nCOMMIT;")
-            except Exception:
-                if self.db.in_transaction:
-                    self.db.execute("ROLLBACK")
-                raise
-
-    def _register_functions(self) -> None:
-        """SQL functions used by planner-generated queries (ARCHITECTURE.md section 3)."""
-        d = self.db
-
-        def sp_text(sid, start, end):
-            if sid is None or start is None or end is None:
-                return None
-            return self.snapshot_bytes(sid)[start:end].decode("utf-8", "replace")
-
-        def sp_re(pattern, sid, start, end):
-            text = sp_text(sid, start, end)
-            return 1 if text is not None and _compile(pattern).search(text) else 0
-
-        def num(v):
-            from .numparse import sql_number
-
-            return sql_number(v)
-
-        d.create_function("spanql_text", 3, sp_text, deterministic=True)
-        d.create_function("spanql_re", 4, sp_re, deterministic=True)
-        d.create_function("spanql_num", 1, num, deterministic=True)
-        d.set_progress_handler(self._progress, 100_000)
-
-    def _progress(self) -> int:
-        if self._deadline is not None and time.monotonic() > self._deadline:
-            return 1  # abort the running statement
-        return 0
-
-    @contextmanager
-    def deadline(self, seconds: float | None) -> Iterator[None]:
-        """Abort long-running statements inside the block (raises sqlite3.OperationalError)."""
-        prev = self._deadline
-        self._deadline = None if seconds is None else time.monotonic() + seconds
-        try:
-            yield
-        finally:
-            self._deadline = prev
+        self.conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.create_function("regexp", 2, _regexp, deterministic=True)
+        self.conn.create_function("spanql_glob", 2, glob_match, deterministic=True)
+        self.conn.create_function("spanql_num", 1, _num, deterministic=True)
+        self.conn.set_progress_handler(_progress, 20_000)
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        if self.path != ":memory:":
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.executescript(SCHEMA)
+        self.conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+        self._text_cache: dict[str, bytes] = {}
+        self._line_cache: dict[str, list[int]] = {}
 
     def close(self) -> None:
-        self.db.close()
-
-    def __enter__(self) -> "Store":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()
-
-    @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            self.db.execute("BEGIN IMMEDIATE")
+            self.conn.close()
+
+    # ------------------------------------------------------------------ basics
+    @contextmanager
+    def tx(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
             try:
-                yield self.db
+                yield self.conn
             except BaseException:
-                self.db.execute("ROLLBACK")
+                self.conn.execute("ROLLBACK")
                 raise
             else:
-                self.db.execute("COMMIT")
+                self.conn.execute("COMMIT")
 
-    # -------------------------------------------------------------- snapshots
+    def query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(sql, tuple(params)).fetchall()
 
-    def snapshot_bytes(self, snapshot_id: str) -> bytes:
-        data = self._cache.get(snapshot_id)
-        if data is not None:
-            self._cache.move_to_end(snapshot_id)
-            return data
-        row = self.db.execute("SELECT text FROM snapshot WHERE id=?", (snapshot_id,)).fetchone()
+    def one(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
+        with self._lock:
+            row: sqlite3.Row | None = self.conn.execute(sql, tuple(params)).fetchone()
+            return row
+
+    # ----------------------------------------------------------------- sources
+    def get_source(self, uri: str) -> sqlite3.Row | None:
+        return self.one("SELECT * FROM source WHERE uri = ?", (uri,))
+
+    def list_sources(self, include_removed: bool = False) -> list[sqlite3.Row]:
+        where = "" if include_removed else "WHERE removed = 0"
+        return self.query(f"SELECT * FROM source {where} ORDER BY uri")
+
+    def mark_removed(self, root: str, keep_uris: set[str]) -> int:
+        rows = self.query("SELECT id, uri FROM source WHERE root = ? AND removed = 0", (root,))
+        gone = [r["id"] for r in rows if r["uri"] not in keep_uris]
+        with self.tx() as c:
+            for sid in gone:
+                c.execute("UPDATE source SET removed = 1 WHERE id = ?", (sid,))
+        return len(gone)
+
+    # --------------------------------------------------------------- snapshots
+    def add_snapshot(
+        self,
+        *,
+        uri: str,
+        path: str,
+        kind: str,
+        root: str,
+        raw_sha256: str,
+        converted: Converted,
+        git_commit: str | None = None,
+    ) -> tuple[str, bool]:
+        """Store a snapshot and its blocks. Returns (snapshot_id, created)."""
+        data = converted.text.encode("utf-8")
+        text_sha = sha256_bytes(data)
+        snap_id = snapshot_id_for(uri, text_sha)
+        with self.tx() as c:
+            src = c.execute("SELECT * FROM source WHERE uri = ?", (uri,)).fetchone()
+            if src is None:
+                cur = c.execute(
+                    "INSERT INTO source(uri, path, kind, root) VALUES(?,?,?,?)",
+                    (uri, path, kind, root),
+                )
+                source_id = cur.lastrowid
+            else:
+                source_id = src["id"]
+                c.execute(
+                    "UPDATE source SET path=?, kind=?, root=?, removed=0 WHERE id=?",
+                    (path, kind, root, source_id),
+                )
+            exists = c.execute("SELECT source_id FROM snapshot WHERE id = ?", (snap_id,)).fetchone()
+            created = False
+            if exists is None:
+                created = True
+                c.execute(
+                    "INSERT INTO snapshot(id, text_sha256, source_id, ingested_at, raw_sha256,"
+                    " converter, git_commit, text, offset_map, meta) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        snap_id,
+                        text_sha,
+                        source_id,
+                        now_iso(),
+                        raw_sha256,
+                        converted.converter,
+                        git_commit,
+                        data,
+                        json.dumps(converted.offset_map) if converted.offset_map else None,
+                        json.dumps(converted.meta),
+                    ),
+                )
+                self._insert_blocks(c, snap_id, data, converted.blocks)
+            c.execute("UPDATE source SET current_snapshot = ? WHERE id = ?", (snap_id, source_id))
+        return snap_id, created
+
+    def _insert_blocks(
+        self, c: sqlite3.Connection, snap_id: str, data: bytes, blocks: list[BlockSpec]
+    ) -> None:
+        line_starts = _line_starts(data)
+        ids: list[int] = []
+        for b in blocks:
+            if not (0 <= b.start <= b.end <= len(data)):
+                raise ValueError(f"block out of range: {b}")
+            chunk = data[b.start : b.end]
+            ls = _line_of(line_starts, b.start)
+            le = _line_of(line_starts, max(b.start, b.end - 1))
+            cur = c.execute(
+                "INSERT INTO block(snapshot_id, kind, start, end, text_sha256, path, line_start,"
+                " line_end, page) VALUES(?,?,?,?,?,?,?,?,?)",
+                (snap_id, b.kind, b.start, b.end, sha256_bytes(chunk), b.path, ls, le, b.page),
+            )
+            bid = int(cur.lastrowid or 0)
+            ids.append(bid)
+            if b.index_text:
+                c.execute(
+                    "INSERT INTO block_fts(rowid, text) VALUES(?, ?)",
+                    (bid, b.fts_text or chunk.decode("utf-8", errors="replace")),
+                )
+            if b.log is not None:
+                lg = b.log
+                c.execute(
+                    "INSERT INTO log_record(block_id, ts, level, logger, message_start,"
+                    " message_end, fields) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        bid,
+                        lg.get("ts"),
+                        lg.get("level"),
+                        lg.get("logger"),
+                        lg.get("message_start"),
+                        lg.get("message_end"),
+                        json.dumps(lg.get("fields") or {}, sort_keys=True),
+                    ),
+                )
+            if b.row is not None:
+                c.execute(
+                    "INSERT INTO table_row(block_id, table_id, row, fields) VALUES(?,?,?,?)",
+                    (bid, b.row["table_id"], b.row["row"], json.dumps(b.row["fields"])),
+                )
+            if b.cell is not None:
+                cl = b.cell
+                row_block = ids[cl["row_index"]] if cl.get("row_index") is not None else None
+                c.execute(
+                    "INSERT INTO table_cell(block_id, table_id, row, col, header, row_block)"
+                    " VALUES(?,?,?,?,?,?)",
+                    (bid, cl["table_id"], cl["row"], cl["col"], cl.get("header"), row_block),
+                )
+            if b.symbol is not None:
+                sy = b.symbol
+                parent = ids[sy["parent_index"]] if sy.get("parent_index") is not None else None
+                c.execute(
+                    "INSERT INTO code_symbol(block_id, lang, kind, name, qualified_name,"
+                    " parent_block, calls) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        bid,
+                        sy.get("lang"),
+                        sy.get("kind"),
+                        sy.get("name"),
+                        sy.get("qualified_name"),
+                        parent,
+                        json.dumps(sorted(set(sy.get("calls") or []))),
+                    ),
+                )
+
+    def snapshot_text(self, snap_id: str) -> bytes:
+        if snap_id in self._text_cache:
+            return self._text_cache[snap_id]
+        row = self.one("SELECT text, text_sha256 FROM snapshot WHERE id = ?", (snap_id,))
         if row is None:
-            raise StoreError(f"unknown snapshot {snapshot_id[:SNAPSHOT_PREFIX]}")
-        data = bytes(row[0])
-        self._cache[snapshot_id] = data
-        self._cache_bytes += len(data)
-        while self._cache_bytes > self._cache_limit and len(self._cache) > 1:
-            _, old = self._cache.popitem(last=False)
-            self._cache_bytes -= len(old)
+            raise SpanError(f"unknown snapshot {snap_id[:12]}")
+        data = bytes(row["text"])
+        if sha256_bytes(data) != row["text_sha256"]:
+            raise SpanError(f"snapshot {snap_id[:12]} is corrupt (hash mismatch)")
+        if len(self._text_cache) > 64:
+            self._text_cache.clear()
+        self._text_cache[snap_id] = data
         return data
 
-    def resolve_snapshot(self, prefix: str) -> str:
+    def expand_snapshot_id(self, prefix: str) -> str:
         if len(prefix) == 64:
-            rows = self.db.execute("SELECT id FROM snapshot WHERE id=?", (prefix,)).fetchall()
-        else:
-            rows = self.db.execute(
-                "SELECT id FROM snapshot WHERE id >= ? AND id < ? LIMIT 3", (prefix, prefix + "g")
-            ).fetchall()
+            return prefix
+        rows = self.query(
+            "SELECT id FROM snapshot WHERE id >= ? AND id < ? LIMIT 2", (prefix, prefix + "g")
+        )
         if not rows:
-            raise StoreError(f"no snapshot with prefix {prefix}")
+            raise SpanError(f"unknown snapshot prefix {prefix}")
         if len(rows) > 1:
-            raise StoreError(f"snapshot prefix {prefix} is ambiguous; use more characters")
-        return rows[0][0]
+            raise SpanError(f"snapshot prefix {prefix} is ambiguous; use more characters")
+        return str(rows[0]["id"])
 
-    def verify_snapshot(self, snapshot_id: str) -> bool:
-        """Full integrity check: the stored text must hash to its id."""
-        return sha256_hex(self.snapshot_bytes(snapshot_id)) == snapshot_id
+    def line_starts(self, snap_id: str) -> list[int]:
+        if snap_id not in self._line_cache:
+            self._line_cache[snap_id] = _line_starts(self.snapshot_text(snap_id))
+        return self._line_cache[snap_id]
 
-    # ------------------------------------------------------------------ spans
-
-    def make_span(self, snapshot_id: str, start: int, end: int) -> Span:
-        data = self.snapshot_bytes(snapshot_id)
-        if not (0 <= start <= end <= len(data)):
-            raise StoreError(
-                f"span {start}:{end} is outside snapshot {snapshot_id[:SNAPSHOT_PREFIX]} "
-                f"({len(data)} bytes)"
-            )
-        return Span(snapshot_id, start, end, sha256_hex(data[start:end]))
-
-    def span_from_id(self, span_id: str) -> Span:
-        prefix, start, end = parse_span_id(span_id)
-        return self.make_span(self.resolve_snapshot(prefix), start, end)
-
-    def span_bytes(self, span: Span, *, verify: bool = True) -> bytes:
-        data = self.snapshot_bytes(span.snapshot_id)
+    # ------------------------------------------------------------------- spans
+    def resolve(self, span: Span | str, expected_sha256: str | None = None) -> ResolvedSpan:
+        if isinstance(span, str):
+            prefix, start, end = Span.parse(span)
+            span = Span(self.expand_snapshot_id(prefix), start, end)
+        data = self.snapshot_text(span.snapshot_id)
         if span.end > len(data):
-            raise SpanIntegrityError(f"{span.id} extends past the end of its snapshot")
-        raw = data[span.start : span.end]
-        if verify and sha256_hex(raw) != span.text_sha256:
-            raise SpanIntegrityError(
-                f"{span.id}: bytes at these offsets no longer hash to the recorded text_sha256"
-            )
-        return raw
-
-    def span_text(self, span: Span, *, verify: bool = True) -> str:
+            raise SpanError(f"span {span.id} is past the end of its snapshot")
+        chunk = data[span.start : span.end]
         try:
-            return self.span_bytes(span, verify=verify).decode("utf-8")
-        except UnicodeDecodeError as e:
-            raise SpanIntegrityError(f"{span.id} does not fall on UTF-8 character boundaries") from e
-
-    def line_starts(self, snapshot_id: str) -> list[int]:
-        idx = self._line_index.get(snapshot_id)
-        if idx is not None:
-            self._line_index.move_to_end(snapshot_id)
-            return idx
-        data = self.snapshot_bytes(snapshot_id)
-        idx = [0]
-        pos = data.find(b"\n")
-        while pos != -1:
-            idx.append(pos + 1)
-            pos = data.find(b"\n", pos + 1)
-        self._line_index[snapshot_id] = idx
-        while len(self._line_index) > 32:
-            self._line_index.popitem(last=False)
-        return idx
-
-    def line_of(self, snapshot_id: str, offset: int) -> int:
-        """1-based line number containing byte ``offset``."""
-        return bisect_right(self.line_starts(snapshot_id), offset)
-
-    def line_range(self, span: Span) -> tuple[int, int]:
-        first = self.line_of(span.snapshot_id, span.start)
-        last = self.line_of(span.snapshot_id, max(span.start, span.end - 1)) if span.end > span.start else first
-        return first, last
-
-    def span_for_lines(self, snapshot_id: str, first: int, last: int) -> Span:
-        """Span covering whole lines ``first..last`` (1-based, inclusive), without the final newline."""
-        starts = self.line_starts(snapshot_id)
-        data = self.snapshot_bytes(snapshot_id)
-        n_lines = len(starts) - (1 if data.endswith(b"\n") else 0)
-        if first < 1 or last < first or first > n_lines:
-            raise StoreError(f"line range {first}-{last} is outside the file ({n_lines} lines)")
-        last = min(last, n_lines)
-        start = starts[first - 1]
-        end = starts[last] - 1 if last < len(starts) else len(data)
-        return self.make_span(snapshot_id, start, max(start, end))
-
-    def read_span_context(self, span: Span, lines: int = 0) -> dict:
-        """Text of a span plus ``lines`` lines of context on each side."""
-        text = self.span_text(span)
-        first, last = self.line_range(span)
-        starts = self.line_starts(span.snapshot_id)
-        data = self.snapshot_bytes(span.snapshot_id)
-        c_first = max(1, first - lines)
-        c_last = min(len(starts), last + lines)
-        c_start = starts[c_first - 1]
-        c_end = starts[c_last] - 1 if c_last < len(starts) else len(data)
-        context = data[c_start : max(c_start, c_end)].decode("utf-8", "replace")
-        return {
-            "span": span.id,
-            "text": text,
-            "line_start": first,
-            "line_end": last,
-            "context": context,
-            "context_line_start": c_first,
-            "context_line_end": c_last,
-        }
-
-    def locate(self, span: Span) -> Location:
-        rows = self.db.execute(
-            """SELECT s.uri, s.current_snapshot
-               FROM source_snapshot ss JOIN source s ON s.id = ss.source_id
-               WHERE ss.snapshot_id = ? ORDER BY ss.id DESC""",
+            text = chunk.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SpanError(f"span {span.id} splits a UTF-8 character") from exc
+        digest = sha256_bytes(chunk)
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise SpanError(f"span {span.id} bytes don't match recorded hash")
+        row = self.one(
+            "SELECT src.uri, src.path, src.kind, src.current_snapshot FROM snapshot s"
+            " JOIN source src ON src.id = s.source_id WHERE s.id = ?",
             (span.snapshot_id,),
-        ).fetchall()
-        seen: dict[str, bool] = {}
-        for r in rows:
-            seen.setdefault(r["uri"], r["current_snapshot"] == span.snapshot_id)
-        uris = sorted(seen, key=lambda u: (not seen[u], u))
-        first, last = self.line_range(span)
-        blk = self.db.execute(
-            """SELECT kind, path, page FROM block WHERE snapshot_id=? AND start<=? AND "end">=?
-               ORDER BY ("end"-start) ASC LIMIT 1""",
+        )
+        assert row is not None
+        ls = self.line_starts(span.snapshot_id)
+        page = self.one(
+            "SELECT page FROM block WHERE snapshot_id = ? AND start <= ? AND end >= ?"
+            " AND page IS NOT NULL LIMIT 1",
             (span.snapshot_id, span.start, span.end),
-        ).fetchone()
-        return Location(
-            sources=tuple(uris),
-            line_start=first,
-            line_end=last,
-            block_kind=blk["kind"] if blk else None,
-            path=blk["path"] if blk else None,
-            page=blk["page"] if blk else None,
-            current=any(seen.values()),
+        )
+        return ResolvedSpan(
+            span=span,
+            text=text,
+            text_sha256=digest,
+            source_uri=row["uri"],
+            source_path=row["path"],
+            source_kind=row["kind"],
+            line_start=_line_of(ls, span.start),
+            line_end=_line_of(ls, max(span.start, span.end - 1)),
+            is_current=row["current_snapshot"] == span.snapshot_id,
+            page=page["page"] if page else None,
         )
 
-    # ---------------------------------------------------------------- sources
+    def block_span(self, block_id: int) -> Span:
+        row = self.one("SELECT snapshot_id, start, end FROM block WHERE id = ?", (block_id,))
+        if row is None:
+            raise SpanError(f"unknown block {block_id}")
+        return Span(row["snapshot_id"], row["start"], row["end"])
 
-    def _source(self, r: sqlite3.Row) -> SourceRow:
-        return SourceRow(r["id"], r["uri"], r["kind"], r["root"], r["rel_path"], r["current_snapshot"])
+    def block_text(self, block_id: int) -> str:
+        sp = self.block_span(block_id)
+        return self.snapshot_text(sp.snapshot_id)[sp.start : sp.end].decode("utf-8")
 
-    def list_sources(self, glob: str | None = None, *, include_deleted: bool = False) -> list[SourceRow]:
-        rows = self.db.execute("SELECT * FROM source ORDER BY uri").fetchall()
-        out = [self._source(r) for r in rows]
-        if not include_deleted:
-            out = [s for s in out if s.current_snapshot is not None]
-        if glob:
-            out = [s for s in out if match_uri(glob, s.uri)]
+    def read_with_context(self, span: Span | str, context_lines: int = 2) -> dict[str, Any]:
+        rs = self.resolve(span)
+        data = self.snapshot_text(rs.span.snapshot_id)
+        ls = self.line_starts(rs.span.snapshot_id)
+        first = max(1, rs.line_start - context_lines)
+        last = min(len(ls), rs.line_end + context_lines)
+        a = ls[first - 1]
+        b = ls[last] - 1 if last < len(ls) else len(data)
+        out = rs.to_dict()
+        out["context"] = {
+            "line_start": first,
+            "line_end": last,
+            "text": data[a:b].decode("utf-8", errors="replace"),
+        }
         return out
 
-    def get_source(self, uri: str) -> SourceRow | None:
-        r = self.db.execute("SELECT * FROM source WHERE uri=?", (uri,)).fetchone()
-        return self._source(r) if r else None
+    # ------------------------------------------------------------------- stats
+    def stats(self) -> dict[str, Any]:
+        def count(sql: str) -> int:
+            row = self.one(sql)
+            return int(row[0]) if row else 0
 
-    def source_by_id(self, source_id: int) -> SourceRow | None:
-        r = self.db.execute("SELECT * FROM source WHERE id=?", (source_id,)).fetchone()
-        return self._source(r) if r else None
-
-    def is_current(self, uri: str, snapshot_id: str) -> bool:
-        s = self.get_source(uri)
-        return bool(s and s.current_snapshot == snapshot_id)
-
-    def status(self) -> dict:
-        q = lambda sql: self.db.execute(sql).fetchone()[0]  # noqa: E731
-        by_kind = {
+        kinds = {
             r["kind"]: r["n"]
-            for r in self.db.execute(
-                "SELECT kind, COUNT(*) n FROM source WHERE current_snapshot IS NOT NULL GROUP BY kind"
+            for r in self.query(
+                "SELECT kind, COUNT(*) n FROM source WHERE removed = 0 GROUP BY kind"
             )
         }
         return {
-            "store": self.path,
+            "sources": count("SELECT COUNT(*) FROM source WHERE removed = 0"),
+            "sources_by_kind": kinds,
+            "snapshots": count("SELECT COUNT(*) FROM snapshot"),
+            "blocks": count("SELECT COUNT(*) FROM block"),
+            "current_blocks": count(
+                "SELECT COUNT(*) FROM block b JOIN source src"
+                " ON src.current_snapshot = b.snapshot_id AND src.removed = 0"
+            ),
+            "cells": count("SELECT COUNT(*) FROM cell"),
+            "runs": count("SELECT COUNT(*) FROM run"),
             "schema_version": SCHEMA_VERSION,
-            "sources": q("SELECT COUNT(*) FROM source WHERE current_snapshot IS NOT NULL"),
-            "sources_by_kind": by_kind,
-            "snapshots": q("SELECT COUNT(*) FROM snapshot"),
-            "blocks": q("SELECT COUNT(*) FROM block"),
-            "cells": q("SELECT COUNT(*) FROM cell"),
-            "runs": q("SELECT COUNT(*) FROM run"),
-            "bytes": q("SELECT COALESCE(SUM(n_bytes),0) FROM snapshot"),
         }
 
     # ------------------------------------------------------------------- cells
-
-    def save_cells(self, cells: list["dict"]) -> None:
-        """Persist serialized cells (``Cell.to_json()`` dicts) and their dependencies."""
-        with self.transaction() as db:
-            for c in cells:
-                db.execute(
-                    "INSERT OR REPLACE INTO cell(id, question_id, formula, value, type, status, created_at, trace)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
-                    (
-                        c["id"],
-                        c.get("question_id"),
-                        c["formula"],
-                        json.dumps(c["value"]),
-                        c["type"],
-                        c["status"],
-                        c["evaluated_at"],
-                        json.dumps(c, separators=(",", ":")),
-                    ),
+    def save_cell(self, cell: dict[str, Any], question_id: str | None = None) -> None:
+        with self.tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO cell(id, question_id, formula, value, type, status,"
+                " created_at, trace) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    cell["id"],
+                    question_id,
+                    cell["formula"],
+                    json.dumps(cell["value"]),
+                    cell["value"].get("type", "?"),
+                    cell["status"],
+                    cell["evaluated_at"],
+                    json.dumps(cell),
+                ),
+            )
+            c.execute("DELETE FROM cell_dep WHERE cell_id = ?", (cell["id"],))
+            for inp in cell.get("inputs", []):
+                c.execute(
+                    "INSERT INTO cell_dep(cell_id, dep_kind, ref) VALUES(?,?,?)",
+                    (cell["id"], inp["kind"], inp.get("id") or inp.get("query", "")),
                 )
-                db.execute("DELETE FROM cell_dep WHERE cell_id=?", (c["id"],))
-                for dep_kind, ref in cell_deps(c):
-                    db.execute(
-                        "INSERT INTO cell_dep(cell_id, dep_kind, ref) VALUES (?,?,?)", (c["id"], dep_kind, ref)
-                    )
 
-    def get_cell(self, cell_id: str) -> dict | None:
-        r = self.db.execute("SELECT trace FROM cell WHERE id=?", (cell_id,)).fetchone()
-        return json.loads(r[0]) if r else None
+    def get_cell(self, cell_id: str) -> dict[str, Any] | None:
+        row = self.one("SELECT trace FROM cell WHERE id = ?", (cell_id,))
+        return json.loads(row["trace"]) if row else None
 
-    def cells_for_question(self, question_id: str) -> list[dict]:
-        rows = self.db.execute(
-            "SELECT trace FROM cell WHERE question_id=? ORDER BY json_extract(trace,'$.index')", (question_id,)
-        ).fetchall()
-        return [json.loads(r[0]) for r in rows]
+    def save_run(self, run_id: str, question: str, status: str, record: dict[str, Any]) -> None:
+        with self.tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO run(id, created_at, question, status, record)"
+                " VALUES(?,?,?,?,?)",
+                (run_id, now_iso(), question, status, json.dumps(record, default=str)),
+            )
 
-    def staleness(self, cell: dict) -> list[dict]:
-        """Inputs of a cell whose source has since changed (empty list = fresh)."""
-        stale: list[dict] = []
-        for inp in cell.get("inputs", []):
-            kind = inp.get("kind")
-            if kind == "span":
-                uri = inp.get("source")
-                if uri is None:
+    def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.query(
+            "SELECT id, created_at, question, status FROM run ORDER BY created_at DESC, id LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in rows]
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self.one("SELECT record FROM run WHERE id = ?", (run_id,))
+        return json.loads(row["record"]) if row else None
+
+    # ---------------------------------------------------------------------- gc
+    def gc_snapshots(self, retention_days: int) -> int:
+        """Delete non-current snapshots older than retention that no cell references."""
+        cutoff = datetime.now(UTC).timestamp() - retention_days * 86400
+        rows = self.query(
+            "SELECT s.id, s.ingested_at FROM snapshot s"
+            " WHERE s.id NOT IN (SELECT current_snapshot FROM source"
+            " WHERE current_snapshot IS NOT NULL)"
+        )
+        referenced = {
+            r["ref"].split(":")[1]
+            for r in self.query("SELECT ref FROM cell_dep WHERE dep_kind = 'span'")
+            if r["ref"].startswith("sp:")
+        }
+        removed = 0
+        with self.tx() as c:
+            for r in rows:
+                if datetime.fromisoformat(r["ingested_at"]).timestamp() > cutoff:
                     continue
-                src = self.get_source(uri)
-                if src is None or src.current_snapshot != inp["snapshot"]:
-                    stale.append({"kind": "span", "id": inp["id"], "source": uri,
-                                  "reason": "source deleted" if src is None or src.current_snapshot is None
-                                  else "source changed"})
-            elif kind == "query":
-                q = inp["query"]
-                kind = q.get("kind") if q.get("op") == "FIND" and q.get("kind") in ("doc", "log", "file", "code") else None
-                now = {s.uri: s.current_snapshot for s in self.list_sources(q.get("src"))
-                       if kind is None or s.kind == kind}
-                if now != inp.get("snapshots", {}):
-                    stale.append({"kind": "query", "op": inp.get("op"), "reason": "matching sources changed"})
-            elif kind == "cell":
-                dep = self.get_cell(inp["id"])
-                if dep is None:
-                    stale.append({"kind": "cell", "id": inp["id"], "reason": "cell missing"})
-                elif self.staleness(dep):
-                    stale.append({"kind": "cell", "id": inp["id"], "reason": "depends on a stale cell"})
-        return stale
+                if r["id"][:8] in referenced:
+                    continue
+                bids = [
+                    x[0]
+                    for x in c.execute("SELECT id FROM block WHERE snapshot_id = ?", (r["id"],))
+                ]
+                for t in ("log_record", "table_row", "table_cell", "code_symbol"):
+                    c.executemany(f"DELETE FROM {t} WHERE block_id = ?", [(b,) for b in bids])
+                c.executemany("DELETE FROM block_fts WHERE rowid = ?", [(b,) for b in bids])
+                c.execute("DELETE FROM block WHERE snapshot_id = ?", (r["id"],))
+                c.execute("DELETE FROM snapshot WHERE id = ?", (r["id"],))
+                removed += 1
+        self._text_cache.clear()
+        self._line_cache.clear()
+        return removed
 
-    # -------------------------------------------------------------------- misc
-
-    def block_count(self, snapshot_id: str) -> int:
-        return self.db.execute("SELECT COUNT(*) FROM block WHERE snapshot_id=?", (snapshot_id,)).fetchone()[0]
-
-
-def cell_deps(cell: dict) -> list[tuple[str, str]]:
-    """(dep_kind, ref) pairs for the cell_dep table."""
-    deps: list[tuple[str, str]] = []
-    for inp in cell.get("inputs", []):
-        kind = inp.get("kind")
-        if kind == "span":
-            deps.append(("span", inp["id"]))
-        elif kind == "cell":
-            deps.append(("cell", inp["id"]))
-        elif kind == "query":
-            deps.append(("query", json.dumps(inp.get("query"), sort_keys=True)))
-            for sid in sorted(set(inp.get("snapshots", {}).values())):
-                deps.append(("snapshot", sid))  # keeps the scanned snapshots alive through GC
-    return deps
+    def backup(self, dest: str | Path) -> None:
+        with self._lock:
+            target = sqlite3.connect(str(dest))
+            try:
+                self.conn.backup(target)
+            finally:
+                target.close()
 
 
+def snapshot_id_for(uri: str, text_sha256: str) -> str:
+    """Snapshot ids are content-addressed *per source*: identical files under two URIs get
+    distinct snapshots, so every span knows which file it came from."""
+    return sha256_bytes(uri.encode("utf-8") + b"\0" + text_sha256.encode("ascii"))
 
 
-def nfc(text: str) -> str:
-    return unicodedata.normalize("NFC", text)
+def _line_starts(data: bytes) -> list[int]:
+    starts = [0]
+    i = data.find(b"\n")
+    while i != -1:
+        starts.append(i + 1)
+        i = data.find(b"\n", i + 1)
+    return starts
+
+
+def _line_of(starts: list[int], offset: int) -> int:
+    """1-based line number containing byte ``offset``."""
+    return bisect.bisect_right(starts, offset)

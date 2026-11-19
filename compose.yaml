@@ -1,0 +1,47 @@
+# spanql + a llama.cpp model server.
+#
+#   docker compose run --rm pull          # once: download the default model into the volume
+#   docker compose up -d                  # CPU
+#   docker compose -f compose.yaml -f compose.gpu.yaml up -d   # NVIDIA GPU (container toolkit)
+#   open http://127.0.0.1:7717
+#
+# Put the folders you want to query under ./sources (or change the bind mount below).
+# llama.cpp tags verified to exist on 2026-11-18: server, server-cuda, server-vulkan.
+# For reproducible deploys pin by digest: image: ghcr.io/ggml-org/llama.cpp:server@sha256:...
+
+services:
+  spanql:
+    build: .
+    image: spanql:local
+    ports: ["127.0.0.1:7717:7717"]     # loopback only on the host
+    volumes:
+      - spanql-data:/data
+      - models:/models
+      - ./sources:/sources:ro          # sources are always mounted read-only
+    environment:
+      SPANQL_MODEL__ENDPOINT: http://llm:8080/v1
+    depends_on:
+      llm:
+        condition: service_started
+        required: false
+    restart: unless-stopped
+
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: ["-m", "/models/qwen3.5-4b-instruct-q4_k_m.gguf", "-c", "16384", "--jinja",
+              "--host", "0.0.0.0", "--port", "8080"]
+    volumes: ["models:/models:ro"]
+    restart: unless-stopped
+
+  # one-off model download: `docker compose run --rm pull [alias]`
+  pull:
+    profiles: ["tools"]
+    image: spanql:local
+    build: .
+    entrypoint: ["spanql", "model", "pull"]
+    command: ["qwen3.5-4b-instruct-q4_k_m"]
+    volumes: ["models:/models"]
+
+volumes:
+  spanql-data: {}
+  models: {}

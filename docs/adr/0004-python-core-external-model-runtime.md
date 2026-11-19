@@ -1,6 +1,6 @@
 # ADR-0004: Python core; model served by a separate OpenAI-compatible runtime
 
-- Status: Proposed
+- Status: Proposed (implemented on `feat/implementation`; deviations in [ADR-0007](0007-implementation-deviations.md))
 - Date: 2026-11-17
 
 ## Context

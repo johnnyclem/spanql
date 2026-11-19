@@ -1,178 +1,334 @@
-"""Ingestion: discover -> convert -> normalize -> snapshot -> segment -> index."""
+"""Discover files under configured roots and ingest them into the span store."""
 
 from __future__ import annotations
 
-import glob as _glob
-import re
+import glob as globmod
+import hashlib
+import os
+import subprocess
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
-from ..blocks import Document
-from ..spans import sha256_hex
-from ..store import Store, commit_version, mark_deleted
-from .discover import discover, git_commit
-from .kinds import classify, jsonl_parser_hint
-from .logs import segment_log
-from .normalize import normalize
-from .pycode import segment_python
-from .tables import segment_csv, segment_json
-from .textseg import segment_chunks, segment_lines, segment_prose
+import pathspec
 
-SEGMENTER_VERSION = 1
-DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024
+from spanql.blocks import Converted
+from spanql.config import SourceConfig
+from spanql.ingest import code as code_conv
+from spanql.ingest import converters as cv
+from spanql.ingest.logs import convert_log
+from spanql.store.db import Store
+
+MAX_FILE_BYTES = 20 * 1024 * 1024
+
+DOC_EXT = {".md", ".markdown", ".mdx", ".rst", ".txt", ".adoc", ".html", ".htm", ".pdf", ".text"}
+FILE_EXT = {
+    ".csv",
+    ".tsv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".xml",
+    ".env.example",
+    ".conf",
+    ".properties",
+}
+LOG_EXT = {".log", ".jsonl", ".ndjson", ".out", ".err"}
+CODE_EXT = set(code_conv.LANG_BY_EXT) | {
+    ".rs",
+    ".java",
+    ".kt",
+    ".rb",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".cs",
+    ".swift",
+    ".m",
+    ".php",
+    ".scala",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".sql",
+    ".lua",
+    ".ex",
+    ".exs",
+    ".erl",
+    ".hs",
+    ".clj",
+    ".dart",
+    ".r",
+    ".jl",
+    ".vue",
+    ".svelte",
+    ".tf",
+    ".proto",
+    ".gradle",
+    ".mk",
+}
+ALWAYS_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".venv",
+    "node_modules",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    "dist",
+    "build",
+    ".idea",
+    ".DS_Store",
+}
+SPECIAL_NAMES = {"Dockerfile": "code", "Makefile": "code", "Containerfile": "code"}
 
 
-@dataclass(slots=True)
+def ext_of(path: str) -> str:
+    name = os.path.basename(path)
+    lower = name.lower()
+    # rotated logs: app.log.1, app.log.2.gz is binary and skipped later
+    parts = lower.split(".")
+    if len(parts) >= 3 and parts[-2] == "log" and parts[-1].isdigit():
+        return ".log"
+    return os.path.splitext(lower)[1]
+
+
+def detect_kind(path: str) -> str | None:
+    name = os.path.basename(path)
+    if name in SPECIAL_NAMES:
+        return SPECIAL_NAMES[name]
+    ext = ext_of(path)
+    if ext in LOG_EXT:
+        return "log"
+    if ext in DOC_EXT:
+        return "doc"
+    if ext in FILE_EXT:
+        return "file"
+    if ext in CODE_EXT:
+        return "code"
+    return None
+
+
+def is_binary(raw: bytes) -> bool:
+    return b"\x00" in raw[:8192]
+
+
+def convert(raw: bytes, path: str, uri: str, kind: str, parser: str = "auto") -> Converted:
+    ext = ext_of(path)
+    if kind == "log" or ext in LOG_EXT:
+        return convert_log(raw, parser)
+    if ext in (".md", ".markdown", ".mdx"):
+        return cv.convert_markdown(raw)
+    if ext in (".html", ".htm"):
+        return cv.convert_html(raw)
+    if ext == ".pdf":
+        return cv.convert_pdf(raw)
+    if ext == ".csv":
+        return cv.convert_delimited(raw, ",")
+    if ext == ".tsv":
+        return cv.convert_delimited(raw, "\t")
+    if ext in CODE_EXT or os.path.basename(path) in SPECIAL_NAMES:
+        return code_conv.convert_code(raw, uri, ext)
+    if ext in FILE_EXT:
+        return cv.convert_lines(raw)
+    return cv.convert_plain(raw)
+
+
+# --------------------------------------------------------------------- discovery
+@dataclass
+class Discovered:
+    path: str
+    uri: str
+    kind: str
+
+
+@dataclass
+class RootInfo:
+    name: str
+    base: str
+    git_commit: str | None = None
+    files: list[Discovered] = field(default_factory=list)
+
+
+def _git(base: str, *args: str) -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", "-C", base, *args], capture_output=True, text=True, timeout=60, check=True
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout
+
+
+def _ignore_spec(base: Path) -> pathspec.PathSpec | None:
+    patterns: list[str] = []
+    for name in (".gitignore", ".spanqlignore"):
+        f = base / name
+        if f.exists():
+            patterns.extend(f.read_text(errors="replace").splitlines())
+    return pathspec.GitIgnoreSpec.from_lines(patterns) if patterns else None
+
+
+def discover(src: SourceConfig) -> RootInfo:
+    raw = os.path.expanduser(src.path)
+    has_glob = any(ch in raw for ch in "*?[")
+    if has_glob:
+        base = raw
+        while any(ch in base for ch in "*?["):
+            base = os.path.dirname(base)
+        paths = sorted(p for p in globmod.glob(raw, recursive=True) if os.path.isfile(p))
+        base = os.path.abspath(base or ".")
+        info = RootInfo(src.name or os.path.basename(base) or "root", base)
+        rels = [os.path.relpath(os.path.abspath(p), base) for p in paths]
+    elif os.path.isfile(raw):
+        base = os.path.dirname(os.path.abspath(raw))
+        info = RootInfo(src.name or os.path.basename(base) or "root", base)
+        rels = [os.path.basename(raw)]
+    elif os.path.isdir(raw):
+        base = os.path.abspath(raw)
+        info = RootInfo(src.name or os.path.basename(base.rstrip("/")) or "root", base)
+        rels = list(_walk(base, src.respect_gitignore, info))
+    else:
+        raise FileNotFoundError(f"source path not found: {src.path}")
+
+    for rel in rels:
+        full = os.path.join(base, rel)
+        kind = src.kind if src.kind != "auto" else detect_kind(full)
+        if kind is None:
+            kind = "doc"  # unknown text files are documents; binaries are dropped at read time
+        info.files.append(Discovered(full, f"{info.name}/{rel.replace(os.sep, '/')}", kind))
+    return info
+
+
+def _walk(base: str, respect_gitignore: bool, info: RootInfo) -> Iterator[str]:
+    if respect_gitignore and os.path.isdir(os.path.join(base, ".git")):
+        out = _git(base, "ls-files", "-co", "--exclude-standard", "-z")
+        if out is not None:
+            info.git_commit = (_git(base, "rev-parse", "HEAD") or "").strip() or None
+            for rel in sorted(p for p in out.split("\0") if p):
+                if os.path.isfile(os.path.join(base, rel)) and not (
+                    set(Path(rel).parts) & ALWAYS_SKIP_DIRS
+                ):
+                    yield rel
+            return
+    spec = _ignore_spec(Path(base)) if respect_gitignore else None
+    for dirpath, dirnames, filenames in os.walk(base):
+        rel_dir = os.path.relpath(dirpath, base)
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d not in ALWAYS_SKIP_DIRS
+            and not (spec and spec.match_file(os.path.normpath(os.path.join(rel_dir, d)) + "/"))
+        )
+        for fn in sorted(filenames):
+            rel = os.path.normpath(os.path.join(rel_dir, fn))
+            if fn in (".gitignore", ".spanqlignore", ".DS_Store"):
+                continue
+            if spec and spec.match_file(rel):
+                continue
+            yield rel
+
+
+# ------------------------------------------------------------------------ ingest
+@dataclass
 class IngestReport:
-    added: list[str] = field(default_factory=list)
-    updated: list[str] = field(default_factory=list)
+    added: int = 0
+    updated: int = 0
     unchanged: int = 0
-    removed: list[str] = field(default_factory=list)
+    removed: int = 0
     skipped: list[tuple[str, str]] = field(default_factory=list)
     errors: list[tuple[str, str]] = field(default_factory=list)
+    roots: list[str] = field(default_factory=list)
 
-    @property
-    def changed(self) -> bool:
-        return bool(self.added or self.updated or self.removed)
-
-    def to_json(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         return {
-            "added": self.added, "updated": self.updated, "unchanged": self.unchanged, "removed": self.removed,
+            "roots": self.roots,
+            "added": self.added,
+            "updated": self.updated,
+            "unchanged": self.unchanged,
+            "removed": self.removed,
             "skipped": [{"path": p, "reason": r} for p, r in self.skipped],
             "errors": [{"path": p, "error": e} for p, e in self.errors],
         }
 
 
-def module_name(rel_path: str) -> str:
-    p = re.sub(r"\.py$", "", rel_path).replace("/", ".")
-    return p[: -len(".__init__")] if p.endswith(".__init__") else p
-
-
-def convert(
-    raw: bytes, kind: str, converter: str, rel_path: str, *, parser: str = "auto", year: int | None = None
-) -> Document:
-    """Raw bytes -> canonical text + blocks."""
-    norm = normalize(raw)
-    data = norm.data
-    tag = f"{kind}:{converter}"
-    if kind == "doc":
-        blocks = segment_prose(data, markdown=converter == "markdown")
-    elif kind == "log":
-        parser = jsonl_parser_hint(rel_path) or parser
-        blocks, used = segment_log(data, parser, year=year)
-        tag = f"log:{used}"
-    elif kind == "file" and converter in ("csv", "tsv"):
-        blocks = segment_csv(data, delim=b"\t" if converter == "tsv" else b",")
-        if not blocks:
-            blocks, tag = segment_lines(data), "file:lines"
-    elif kind == "file" and converter == "json":
-        blocks = segment_json(data)
-        if blocks is None:
-            blocks, tag = segment_lines(data), "file:lines"
-    elif kind == "code":
-        blocks = segment_python(data, module_name(rel_path)) if converter == "python" else None
-        if blocks is None:
-            blocks, tag = segment_chunks(data), "code:chunks"
-        blocks = blocks + segment_lines(data, fts=False)  # grep-style unit, not FTS-indexed
-    else:
-        blocks = segment_lines(data)
-    return Document(data=data, blocks=blocks, segmentation=f"{tag}@{SEGMENTER_VERSION}", offset_map=norm.offset_map)
-
-
-def _expand(path: str) -> tuple[Path, list[Path] | None, bool]:
-    """-> (root, explicit file list for glob inputs or None, is_single_file)."""
-    expanded = str(Path(path).expanduser())
-    if any(c in expanded for c in "*?["):
-        parts = Path(expanded).parts
-        fixed: list[str] = []
-        for part in parts:
-            if any(c in part for c in "*?["):
-                break
-            fixed.append(part)
-        root = Path(*fixed) if fixed else Path(".")
-        files = sorted(Path(m) for m in _glob.glob(expanded, recursive=True) if Path(m).is_file())
-        return root.resolve(), [f.resolve() for f in files], False
-    p = Path(expanded).resolve()
-    if not p.exists():
-        raise FileNotFoundError(f"no such file or directory: {path}")
-    return (p.parent if p.is_file() else p), None, p.is_file()
-
-
-def ingest_path(
+def ingest_source(
     store: Store,
-    path: str,
-    *,
-    kind: str | None = None,
-    name: str | None = None,
-    parser: str = "auto",
-    force: bool = False,
-    respect_gitignore: bool = True,
-    remove_missing: bool = True,
-    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
-    year: int | None = None,
+    src: SourceConfig,
+    report: IngestReport | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> IngestReport:
-    """Ingest a file, directory or glob. Re-ingesting unchanged files is a no-op."""
-    root, explicit, single = _expand(path)
-    report = IngestReport()
-    if explicit is not None:
-        files = explicit
-        prefix = name or root.name
-    elif single:
-        files = [Path(path).expanduser().resolve()]
-        prefix = None
-    else:
-        files = discover(root, respect_gitignore=respect_gitignore)
-        prefix = name or root.name
-    commit = git_commit(root) if explicit is None and not single else None
+    report = report or IngestReport()
+    info = discover(src)
+    report.roots.append(f"{info.name} ({info.base})")
     seen: set[str] = set()
-
-    for f in files:
+    for f in info.files:
+        seen.add(f.uri)
         try:
-            rel = f.relative_to(root).as_posix()
-        except ValueError:
-            rel = f.name
-        uri = (name or f.name) if single else f"{prefix}/{rel}"
-        try:
-            cls = classify(rel, kind)
-            if cls is None:
-                report.skipped.append((uri, f"unsupported type {f.suffix or '(none)'} (needs the Docling extra)"))
+            size = os.path.getsize(f.path)
+            if size > MAX_FILE_BYTES:
+                report.skipped.append((f.uri, f"larger than {MAX_FILE_BYTES // 1_048_576} MB"))
                 continue
-            if f.stat().st_size > max_file_bytes:
-                report.skipped.append((uri, f"larger than {max_file_bytes // (1024 * 1024)} MB"))
+            with open(f.path, "rb") as fh:
+                raw = fh.read()
+            if is_binary(raw) and ext_of(f.path) != ".pdf":
+                report.skipped.append((f.uri, "binary"))
                 continue
-            raw = f.read_bytes()
-            if b"\0" in raw[:8192]:
-                report.skipped.append((uri, "binary file"))
-                continue
-            seen.add(uri)
-            raw_hash = sha256_hex(raw)
-            existing = store.get_source(uri)
-            if existing and not force and existing.kind == cls[0] and existing.current_snapshot:
-                cur = store.db.execute(
-                    "SELECT raw_sha256 FROM source_snapshot WHERE source_id=? AND superseded_at IS NULL",
-                    (existing.id,),
-                ).fetchone()
-                if cur and cur["raw_sha256"] == raw_hash:
+            raw_sha = hashlib.sha256(raw).hexdigest()
+            existing = store.get_source(f.uri)
+            if existing is not None and existing["current_snapshot"] and not existing["removed"]:
+                snap = store.one(
+                    "SELECT raw_sha256, converter FROM snapshot WHERE id = ?",
+                    (existing["current_snapshot"],),
+                )
+                if snap is not None and snap["raw_sha256"] == raw_sha:
                     report.unchanged += 1
                     continue
-            doc = convert(raw, cls[0], cls[1], rel, parser=parser, year=year)
-            res = commit_version(
-                store, uri=uri, kind=cls[0], root=str(root), rel_path=rel, raw_sha256=raw_hash,
-                raw_size=len(raw), doc=doc, git_commit=commit,
+            conv = convert(raw, f.path, f.uri, f.kind, src.parser)
+            snap_id, _created = store.add_snapshot(
+                uri=f.uri,
+                path=f.path,
+                kind=f.kind,
+                root=info.base,
+                raw_sha256=raw_sha,
+                converted=conv,
+                git_commit=info.git_commit,
             )
-            (report.updated if existing and existing.current_snapshot else report.added).append(uri)
+            if existing is None:
+                report.added += 1
+            elif existing["current_snapshot"] != snap_id:
+                report.updated += 1
+            else:
+                report.unchanged += 1
             if progress:
-                progress(uri)
-        except Exception as e:  # one bad file must not abort the run
-            report.errors.append((uri, f"{type(e).__name__}: {e}"))
+                progress(f.uri)
+        except Exception as exc:  # one bad file must not stop an ingest
+            report.errors.append((f.uri, f"{type(exc).__name__}: {exc}"))
+    report.removed += store.mark_removed(info.base, seen) if not _is_partial(src) else 0
+    return report
 
-    # Only a whole-directory ingest can tell that a file vanished (a glob or single file says nothing
-    # about its siblings).
-    if remove_missing and explicit is None and not single:
-        for s in store.list_sources():
-            if s.root == str(root) and s.uri.startswith(prefix + "/") and s.uri not in seen:
-                mark_deleted(store, s.uri)
-                report.removed.append(s.uri)
+
+def _is_partial(src: SourceConfig) -> bool:
+    """Single files and globs share a base dir with siblings; only whole directories may mark
+    files that disappeared as removed."""
+    return not os.path.isdir(os.path.expanduser(src.path))
+
+
+def ingest_all(
+    store: Store, sources: list[SourceConfig], progress: Callable[[str], None] | None = None
+) -> IngestReport:
+    report = IngestReport()
+    for src in sources:
+        try:
+            ingest_source(store, src, report, progress)
+        except FileNotFoundError as exc:
+            report.errors.append((src.path, str(exc)))
     return report

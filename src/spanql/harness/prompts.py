@@ -1,129 +1,153 @@
-"""Prompts: a compact description of the DSL plus worked examples (MODEL.md section 4.1).
-
-Constrained decoding limits what the model can *emit* but is not shown to it, so the
-language still has to be described here.
-"""
+"""Prompt construction for the formula writer."""
 
 from __future__ import annotations
 
-import json
-from datetime import date
+from typing import Any
 
-from ..retrieve.retriever import Retrieval
+from spanql.engine.handles import HandleTable
+from spanql.retrieve.retriever import EXCERPT_CHARS
 
-SYSTEM = """You write ONE formula in the spanql language that answers the user's question from their sources. \
-You never write the final answer or any numbers yourself: an engine computes values from the text you point at.
+SYSTEM_PROMPT = """\
+You are spanql's formula writer. You never answer in prose. You write exactly ONE formula in the
+spanql language, and a separate engine evaluates it against the user's sources.
 
-OUTPUT: exactly one of
+FORMS (pick one):
   ANSWER(expr, expr, ..., text:"prose with {0} {1} placeholders")
-  NOT_FOUND("why the sources do not contain it", searched:[$1,$2])
-  AMBIGUOUS("what conflicts", [$3,$5])
+  NOT_FOUND("why the candidates don't answer it", searched:[$1, $2])
+  AMBIGUOUS("why", [$i, $j])          -- sources genuinely conflict
 
-REFERENCES (the only way data enters a formula):
-  $1                  a whole candidate passage
-  $1."exact words"    exact characters copied from candidate $1 (add #2 for the 2nd occurrence)
-  FIND(src:"glob", kind:"log|doc|file|code", re:"regex", contains:"text", day:"2026-11-10",
-       since:"..", until:"..", level:"ERROR", logger:"x", FIELD("status") >= 500)   matching records
-  COLUMN("header", src:"glob", FIELD("other") == "x")   cells of a table column   SYMBOLS(src:"glob", kind:"function|method|class|module", name:"f", calls:"g")
-  LINES(src:"file", from:10, to:20)    [0] = an earlier value of this ANSWER, [c_ab12] = a stored cell
+REFERENCES (all data must come from these):
+  $n                 the whole candidate n
+  $n."exact words"   an exact substring of candidate n, copied character for character
+  $n."words"#2       the 2nd occurrence of that substring
+  FIND(...)          a query over all sources, for counting and aggregating
+  [c_id]             a previously computed cell
+  [0], [1]           an earlier value of this same ANSWER (0-based), e.g. PCT([0], [1], places:1)
 
-FUNCTIONS: extract NUM MONEY PCT_OF DATE DATETIME DURATION TEXT BOOL (read a span; they refuse to guess) | \
-COUNT SUM AVG MIN MAX DISTINCT (SUM/AVG/MIN/MAX accept as:"num|money|pct|date|datetime|duration" over FIND/COLUMN) | \
-ROUND(x, places:2) PCT(a,b,places:1) DIFF(a,b) RATIO(a,b) ABS | DAYS_BETWEEN BEFORE AFTER | \
-IF AND OR NOT EQ NE GT GTE LT LTE CONTAINS. Infix + - * / and == != > >= < <= also work.
+FUNCTIONS:
+  extract: NUM MONEY PCT_OF DATE DATETIME DURATION TEXT BOOL   e.g. MONEY($1."$4.82 million")
+  math:    DIFF(a,b) PCT(part,whole,places:1) RATIO(a,b) ROUND(x,places:2) ABS(x) + - * /
+           DIFF(a,b) is a - b: growth from old to new is DIFF(new, old)
+  dates:   DAYS_BETWEEN(a,b) BEFORE(a,b) AFTER(a,b)
+  logic:   IF(c,a,b) AND OR NOT EQ GT LT CONTAINS(text,"needle")
+  aggregate: COUNT(set) SUM(list) AVG(list) MIN MAX DISTINCT(set)
+  queries:
+    FIND(src:"glob", kind:"log|doc|file|code", re:"regex", match:"words", day:"YYYY-MM-DD",
+         since:"ISO", until:"ISO", level:"ERROR", logger:"glob", FIELD("status") >= 500)
+      text filters are keywords: match:"PaymentTimeout" (words) or re:"regex";
+      positional arguments are only FIELD comparisons like FIELD("status") >= 500
+    FIELD("name", FIND(...))           values of a log field / table column for each match
+    COLUMN(src:"file.csv", "amount", FIELD("region") == "West")
+      values of column "amount" in rows where column "region" is "West"
+    SYMBOLS(src:"glob", kind:"function|method|class|callable", name:"glob", calls:"callee")
+      name: is the symbol's own name; calls: finds symbols whose body calls that function
+    LINES(src:"glob", re:"regex")
 
-RULES
-- Copy quotes exactly from the candidate text; never retype or round a number you read.
-- Pick the candidate that states the requested figure for the requested period/entity.
-- Numbers you type must be in the question, a query filter, or places:. Put no digits in text: except labels like Q3.
-- Use COUNT(FIND(...)) / SUM(COLUMN(...)) for totals over many records instead of listing them.
-- If no candidate or query can answer it, write NOT_FOUND. Do not guess. If sources conflict, write AMBIGUOUS.
+RULES:
+- Never type a number that isn't in a quote; numbers in formulas are only allowed for
+  places:, filters, query arguments, and numbers the user typed in the question.
+  Never put digits in text:"..." outside {n}.
+- Values render with their own unit, currency and scale ($510,000, 11.8%): write "{0}", not
+  "{0}%", "${0}" or "{0} million".
+- Quote the smallest exact span that contains the value, e.g. $3."$4.82 million".
+- Use FIND/COLUMN/SYMBOLS for counts and totals over many lines or rows.
+- If no candidate actually answers the question, write NOT_FOUND(...). Do not guess.
+- Output only the formula.
 
-EXAMPLES
-Q: How much did revenue grow from Q2 to Q3?   (candidates: $1 Q3 report text, $2 Q2 report text)
-ANSWER(DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M")), PCT(DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M")), MONEY($2."$4.31M"), places:1), text:"Revenue grew by {0} ({1}) from Q2 to Q3.")
-
-Q: What was Q3 revenue?
+EXAMPLES (each with its own candidates; your candidates are different):
+Example 1
+CANDIDATES:
+[$1] reports/q3.md · L5
+     Total revenue for the quarter was $4.82 million, up from $4.31 million in Q2.
+QUESTION: What was Q3 revenue?
 ANSWER(MONEY($1."$4.82 million"), text:"Q3 revenue was {0}.")
 
-Q: How many payment timeouts were logged on 2026-11-10, and what share of all errors is that?
-ANSWER(COUNT(FIND(src:"logs/payments-*.log", re:"PaymentTimeout", day:"2026-11-10")), COUNT(FIND(src:"logs/payments-*.log", level:"ERROR", day:"2026-11-10")), PCT([0], [1], places:1), text:"There were {0} payment timeouts out of {1} errors, which is {2}.")
+Example 2
+CANDIDATES:
+[$1] wiki/q2.md · L9
+     Revenue in Q2 came to $6.5M.
+[$2] wiki/q3.md · L2
+     Q3 revenue: $7.1M
+QUESTION: How much did revenue grow from Q2 to Q3?
+ANSWER(DIFF(MONEY($2."$7.1M"), MONEY($1."$6.5M")), PCT([0], MONEY($1."$6.5M"), places:1), text:"Revenue grew by {0} ({1}).")
 
-Q: How many 5xx responses did the API return on 2026-11-16?
-ANSWER(COUNT(FIND(src:"logs/api/*.log", day:"2026-11-16", FIELD("status") >= 500)), text:"The API returned {0} 5xx responses.")
+Example 3
+CANDIDATES:
+[$1] logs/api.log · L88
+     2026-11-16T10:00:01Z ERROR api: upstream failed status=502
+SOURCE SCHEMAS: log logs/api.log: fields ['status']
+QUESTION: How many 5xx responses did the API return on 2026-11-16?
+ANSWER(COUNT(FIND(src:"logs/api.log", day:"2026-11-16", FIELD("status") >= 500)), text:"{0} 5xx responses.")
 
-Q: Which functions call retry_with_backoff?
-ANSWER(COUNT(DISTINCT(SYMBOLS(src:"repo/**/*.py", kind:"function", calls:"retry_with_backoff"))), DISTINCT(SYMBOLS(src:"repo/**/*.py", kind:"function", calls:"retry_with_backoff")), text:"{0} functions call it: {1}.")
+Example 4
+CANDIDATES:
+[$1] data/orders.csv · row 3
+     order_id=17, region=East, total=$90.00
+[$2] src/jobs.py · L40-52 · Sync.run
+     def run(self): ... self.flush() ...
+[$3] logs/worker.log · L12
+     2026-11-02T08:00:00Z WARN worker: QueueFull dropped batch
+SOURCE SCHEMAS: table data/orders.csv: columns ['order_id', 'region', 'total']
+QUESTION: What is the total of East orders?
+ANSWER(SUM(COLUMN(src:"data/orders.csv", "total", FIELD("region") == "East")), text:"East orders total {0}.")
+QUESTION: Which functions call flush?
+ANSWER(DISTINCT(SYMBOLS(kind:"callable", calls:"flush")), text:"Callers of flush: {0}.")
+QUESTION: How many QueueFull warnings were logged on 2026-11-02?
+ANSWER(COUNT(FIND(src:"logs/worker.log", day:"2026-11-02", match:"QueueFull")), text:"{0} QueueFull warnings.")
 
-Q: What is the total number of units sold in EMEA?
-ANSWER(SUM(COLUMN("units", src:"data/sales.csv", FIELD("region") == "EMEA")), text:"EMEA sold {0} units.")
-
-Q: How many days passed between the invoice and the payment?   ($3 = "issued on 2026-03-01 and paid on March 15, 2026")
-ANSWER(DAYS_BETWEEN(DATE($3."2026-03-01"), DATE($3."March 15, 2026")), text:"{0} days passed.")
-
-Q: When was the last error logged?
-ANSWER(MAX(FIND(src:"logs/payments-*.log", level:"ERROR"), as:"datetime"), text:"The last error was logged at {0}.")
-
-Q: What was Q3 churn?   (no candidate mentions churn or retention)
-NOT_FOUND("No churn or retention figure appears in the candidates.", searched:[$1,$2,$3])
-
-Q: What is the timeout?   ($4 says 30 seconds, $7 says 45 seconds, for different services)
-AMBIGUOUS("Two different timeouts are configured.", [$4, $7])
+Example 5
+CANDIDATES:
+[$1] notes/launch.md · L3
+     The launch was announced on March 4, 2026.
+QUESTION: What was Q3 churn?
+NOT_FOUND("No churn figure in the candidates.", searched:[$1])
 """
 
-# Worked examples above that need no corpus to be valid; tests parse and type-check every one.
-EXAMPLE_FORMULAS = [
-    'ANSWER(DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M")), PCT(DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M")), MONEY($2."$4.31M"), places:1), text:"Revenue grew by {0} ({1}) from Q2 to Q3.")',
-    'ANSWER(MONEY($1."$4.82 million"), text:"Q3 revenue was {0}.")',
-    'ANSWER(COUNT(FIND(src:"logs/payments-*.log", re:"PaymentTimeout", day:"2026-11-10")), COUNT(FIND(src:"logs/payments-*.log", level:"ERROR", day:"2026-11-10")), PCT([0], [1], places:1), text:"There were {0} payment timeouts out of {1} errors, which is {2}.")',
-    'ANSWER(COUNT(FIND(src:"logs/api/*.log", day:"2026-11-16", FIELD("status") >= 500)), text:"The API returned {0} 5xx responses.")',
-    'ANSWER(COUNT(DISTINCT(SYMBOLS(src:"repo/**/*.py", kind:"function", calls:"retry_with_backoff"))), DISTINCT(SYMBOLS(src:"repo/**/*.py", kind:"function", calls:"retry_with_backoff")), text:"{0} functions call it: {1}.")',
-    'ANSWER(SUM(COLUMN("units", src:"data/sales.csv", FIELD("region") == "EMEA")), text:"EMEA sold {0} units.")',
-    'ANSWER(DAYS_BETWEEN(DATE($3."2026-03-01"), DATE($3."March 15, 2026")), text:"{0} days passed.")',
-    'ANSWER(MAX(FIND(src:"logs/payments-*.log", level:"ERROR"), as:"datetime"), text:"The last error was logged at {0}.")',
-    'NOT_FOUND("No churn or retention figure appears in the candidates.", searched:[$1,$2,$3])',
-    'AMBIGUOUS("Two different timeouts are configured.", [$4, $7])',
-]
+
+def format_candidates(handles: HandleTable) -> str:
+    lines = []
+    for h in handles.values():
+        text = h.text if len(h.text) <= EXCERPT_CHARS else h.text[:EXCERPT_CHARS] + " …"
+        text = text.replace("\n", "\n     ")
+        where = f"{h.source} · {h.location()}" + (f" · {h.path}" if h.path else "")
+        lines.append(f"[${h.n}] {where}\n     {text}")
+    return "\n".join(lines) if lines else "(no candidates were found)"
 
 
-def _fmt_schema(d: dict) -> str:
-    bits = [f"{d['uri']} [{d['kind']}]"]
-    if "records" in d:
-        bits.append(f"{d['records']} records")
-    if "rows" in d:
-        bits.append(f"{d['rows']} rows")
-    if d.get("time_range"):
-        bits.append(f"days {d['time_range'][0]}..{d['time_range'][1]}")
-    if d.get("levels"):
-        bits.append("levels " + " ".join(f"{k}:{v}" for k, v in d["levels"].items()))
-    for key, label in (("fields", "fields"), ("columns", "columns")):
-        if d.get(key):
-            bits.append(label + ": " + ", ".join(f"{k}={json.dumps(v)}" for k, v in list(d[key].items())[:12]))
-    if d.get("symbols"):
-        bits.append("symbols " + " ".join(f"{k}:{v}" for k, v in d["symbols"].items()))
-    return " · ".join(bits)
+def build_messages(
+    question: str,
+    handles: HandleTable,
+    hints: list[str],
+    *,
+    history: list[dict[str, str]] | None = None,
+    feedback: str | None = None,
+    last_formula: str | None = None,
+    prior_cells: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    user = [f"QUESTION: {question}", "", "CANDIDATES:", format_candidates(handles)]
+    if hints:
+        user += ["", "SOURCE SCHEMAS (usable in FIND/COLUMN/SYMBOLS):"] + [f"- {h}" for h in hints]
+    if prior_cells:
+        user += ["", "EARLIER CELLS (reference as [id]):"] + [
+            f"- [{c['id']}] = {c['value'].get('display')}  ({c['formula']})" for c in prior_cells
+        ]
+    if feedback:
+        user += [
+            "",
+            "YOUR PREVIOUS FORMULA WAS REJECTED:",
+            last_formula or "",
+            "ERRORS:",
+            feedback,
+            "Write a corrected formula, or NOT_FOUND if the candidates can't answer it.",
+        ]
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for turn in (history or [])[-6:]:
+        msgs.append(turn)
+    msgs.append({"role": "user", "content": "\n".join(user)})
+    return msgs
 
 
-def build_user_prompt(question: str, retrieval: Retrieval, today: date) -> str:
-    lines = [f"Today is {today.isoformat()} ({today.strftime('%A')})."]
-    if retrieval.date_hints:
-        lines.append("Date hints: " + "; ".join(f'"{k}" = {v}' for k, v in retrieval.date_hints.items()))
-    if retrieval.catalog:
-        lines.append("\nSources (use these paths in src: globs):")
-        schema_uris = {d["uri"] for d in retrieval.schemas}
-        for d in retrieval.catalog:
-            if d["uri"] not in schema_uris:
-                lines.append(f"- {d['uri']} [{d['kind']}]")
-        for d in retrieval.schemas:
-            lines.append("- " + _fmt_schema(d))
-    lines.append("\nCandidates:" if retrieval.candidates else "\nCandidates: (none retrieved)")
-    for c in retrieval.candidates:
-        where = c.location() + (f" · {c.path}" if c.path else "")
-        lines.append(f'[${c.handle}] {c.uri} · {where} · "{c.excerpt}"')
-    lines.append(f"\nQuestion: {question}\n\nWrite the formula.")
-    return "\n".join(lines)
-
-
-def retry_message(feedback: str) -> str:
-    return ("That formula failed verification:\n" + feedback +
-            "\n\nWrite a corrected formula (only the formula). If the sources cannot support an answer, write NOT_FOUND.")
+RELEVANCE_PROMPT = (
+    "Answer only 'yes' or 'no'. Does this passage state the specific thing the question asks "
+    "about (same metric, period and entity), rather than something merely similar?"
+)

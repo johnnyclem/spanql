@@ -1,6 +1,6 @@
 # ADR-0005: Ship as a Docker image and a Homebrew service; weights downloaded at runtime
 
-- Status: Proposed
+- Status: Proposed (implemented on `feat/implementation`; deviations in [ADR-0007](0007-implementation-deviations.md))
 - Date: 2026-11-17
 
 ## Context

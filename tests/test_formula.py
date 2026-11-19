@@ -3,166 +3,189 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
-from spanql.errors import FormulaTypeError, ParseError
-from spanql.formula.ast import Ambiguous, Answer, BinOp, Call, CellRef, Compare, Neg, NotFound, Num, Ref, Str
-from spanql.formula.parser import lex, parse_formula
-from spanql.formula.typecheck import typecheck
+from spanql.formula import ast as A
+from spanql.formula.gbnf import build_gbnf
+from spanql.formula.parser import FormulaSyntaxError, parse, parse_expr
+
+from .gbnf_matcher import Grammar
+
+GOOD = [
+    'ANSWER(MONEY($1."$4.82 million"), text:"Q3 revenue was {0}.")',
+    'ANSWER(DIFF(MONEY($3."$4.82 million"), MONEY($1."$4.31M")), PCT(DIFF(MONEY($3."$4.82 million"), MONEY($1."$4.31M")), MONEY($1."$4.31M"), places:1), text:"Revenue grew by {0} ({1}).")',
+    'ANSWER(COUNT(FIND(src:"logs/api.log", day:"2026-11-16", FIELD("status") >= 500)), text:"{0} 5xx.")',
+    'ANSWER(SUM(COLUMN(src:"d/x.csv", "amount", FIELD("region") == "West")))',
+    'ANSWER(DISTINCT(SYMBOLS(kind:"callable", calls:"flush")), text:"Callers: {0}.")',
+    'ANSWER(COUNT(FIND(re:"timeout\\\\s+\\\\d+", level:"ERROR")))',
+    'ANSWER(IF(GT(NUM($2."12"), NUM($1."10")), "up", "down"))',
+    'ANSWER(NUM($1."5"#2) + -NUM($2."3") * (NUM($1."2") - NUM($1."1")) / NUM($2."4"))',
+    'ANSWER([c_abc123] , ROUND(RATIO(NUM($1."7"), NUM($2."9")), places:2))',
+    'NOT_FOUND("No churn figure.", searched:[$1, $2])',
+    'NOT_FOUND("nothing")',
+    'AMBIGUOUS("two different dates", [$1, $2])',
+    "ANSWER(AND(TRUE, NOT(FALSE)))",
+]
 
 
-def types(src, **kw):
-    f = parse_formula(src)
-    return typecheck(f, **kw)
+@pytest.mark.parametrize("src", GOOD)
+def test_parse_unparse_roundtrip(src: str) -> None:
+    f = parse(src)
+    again = parse(A.unparse(f))
+    assert again == f
+    assert A.unparse(again) == A.unparse(f)
 
 
-# ------------------------------------------------------------------- parsing
+def test_parse_details() -> None:
+    f = parse('ANSWER(MONEY($3."a \\"b\\""#2), text:"x {0}")')
+    assert isinstance(f, A.Answer) and f.template == "x {0}"
+    call = f.exprs[0]
+    assert isinstance(call, A.Call) and call.name == "MONEY"
+    ref = call.args[0]
+    assert ref == A.HandleRef(3, 'a "b"', 2)
 
 
-def test_spec_examples_parse():
-    f = parse_formula(
-        """ANSWER(
-          DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M")),
-          PCT(DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M")), MONEY($2."$4.31M"), places:1),
-          text:"Revenue grew by {0} ({1}) from Q2 to Q3."
-        )"""
+def test_precedence() -> None:
+    e = parse_expr("1 + 2 * 3 - 4")
+    assert A.unparse(e) in ("1 + 2 * 3 - 4", "(1 + (2 * 3)) - 4")
+    assert isinstance(e, A.BinOp) and e.op == "-"
+
+
+def test_code_fence_tolerated() -> None:
+    f = parse('```\nNOT_FOUND("x")\n```')
+    assert isinstance(f, A.NotFound)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "ANSWER(",
+        "SUM(1)",  # not a top-level form
+        'ANSWER(MONEY($1."x")) trailing',
+        "ANSWER(FOO($1))",
+        'ANSWER($1."unterminated)',
+        'NOT_FOUND("x", searched:[1])',
+    ],
+)
+def test_syntax_errors(bad: str) -> None:
+    with pytest.raises(FormulaSyntaxError):
+        parse(bad)
+
+
+def test_walk_visits_all() -> None:
+    f = parse(GOOD[1])
+    names = [n.name for n in A.walk(f) if isinstance(n, A.Call)]
+    assert names.count("MONEY") == 5
+
+
+# ---------------------------------------------------------------- property tests
+idents = st.sampled_from(["NUM", "MONEY", "SUM", "DIFF", "PCT", "COUNT", "TEXT"])
+strings = st.text(alphabet=st.characters(min_codepoint=32, max_codepoint=126), max_size=8)
+leaf = st.one_of(
+    st.decimals(min_value=0, max_value=10**6, places=2, allow_nan=False).map(
+        lambda d: A.NumberLit(Decimal(str(d)), str(d))
+    ),
+    strings.map(A.StringLit),
+    st.booleans().map(A.BoolLit),
+    st.builds(
+        A.HandleRef, st.integers(1, 30), st.one_of(st.none(), strings.filter(bool)), st.none()
+    ),
+)
+
+
+def _expr(children):
+    return st.one_of(
+        st.builds(lambda n, a: A.Call(n, tuple(a)), idents, st.lists(children, max_size=3)),
+        st.builds(A.BinOp, st.sampled_from(["+", "-", "*", "/"]), children, children),
     )
-    assert isinstance(f, Answer) and len(f.args) == 2 and f.template.startswith("Revenue")
-    pct = f.args[1]
-    assert isinstance(pct, Call) and pct.name == "PCT" and pct.kwargs[0][0] == "places"
-    f = parse_formula('ANSWER(COUNT(FIND(src:"logs/api/*.log", kind:"log", day:"2026-11-16", FIELD("status") >= 500)), text:"x {0}")')
-    find = f.args[0].args[0]
-    assert find.name == "FIND" and isinstance(find.args[0], Compare) and find.args[0].op == ">="
 
 
-def test_refusal_forms():
-    f = parse_formula('NOT_FOUND("No churn figure.", searched:[$1,$2,$3])')
-    assert isinstance(f, NotFound) and f.searched == [1, 2, 3]
-    f = parse_formula('AMBIGUOUS("Two timeouts.", [$4, $7])')
-    assert isinstance(f, Ambiguous) and f.handles == [4, 7]
-    assert parse_formula('NOT_FOUND("none")').searched == []
+exprs = st.recursive(leaf, _expr, max_leaves=10)
 
 
-def test_refs_quotes_occurrence_and_cellrefs():
-    f = parse_formula('ANSWER(NUM($3."a \\"b\\" c"#2), [0], [c_7Hq2])')
-    ref = f.args[0].args[0]
-    assert isinstance(ref, Ref) and (ref.handle, ref.quote, ref.occurrence) == (3, 'a "b" c', 2)
-    assert isinstance(f.args[1], CellRef) and f.args[1].key == 0 and f.args[2].key == "c_7Hq2"
+@settings(max_examples=200, deadline=None)
+@given(st.lists(exprs, min_size=1, max_size=3), st.one_of(st.none(), strings))
+def test_roundtrip_property(es: list[A.Node], tpl: str | None) -> None:
+    f = A.Answer(tuple(es), tpl)
+    text = A.unparse(f)
+    assert A.unparse(parse(text)) == text
 
 
-def test_precedence_and_unary():
-    f = parse_formula("1 + 2 * 3 - -4")
-    e = f.args[0]
-    assert isinstance(e, BinOp) and e.op == "-" and isinstance(e.right, Neg)
-    assert isinstance(e.left, BinOp) and e.left.op == "+" and e.left.right.op == "*"
-    assert parse_formula("(1+2)*3").args[0].op == "*"
+# ---------------------------------------------------------------- grammar
+@pytest.fixture(scope="module")
+def grammar5() -> Grammar:
+    return Grammar(build_gbnf(range(1, 6)))
 
 
-def test_bare_expression_is_implicit_answer():
-    f = parse_formula('COUNT(FIND(src:"a"))')
-    assert isinstance(f, Answer) and f.implicit
+@pytest.mark.parametrize("src", [g for g in GOOD if "$9" not in g])
+def test_grammar_accepts_valid_formulas(grammar5: Grammar, src: str) -> None:
+    assert grammar5.accepts(src), src
 
 
 @pytest.mark.parametrize(
-    "src, fragment",
+    "src",
     [
-        ("", "empty"),
-        ("ANSWER()", "at least one"),
-        ('ANSWER(NUM($1)', "expected `)`"),
-        ('ANSWER(NUM($1), text:"x", NUM($2))', "`text:` must come last"),
-        ('ANSWER(NUM($1), foo:"x")', "only accepts the keyword `text:`"),
-        ("NUM($1.5)", "quoted substring"),
-        ('NUM($1."x"#0)', ">= 1"),
-        ('FIND(src:"a", src:"b")', "given twice"),
-        ("1 < 2 < 3", "chained comparison"),
-        ('"unterminated', "unterminated"),
-        ('"bad \\q escape"', "bad escape"),
-        ('"raw\nnewline"', "raw newline"),
-        ("foo", "not a function call"),
-        ("NUM(@)", "unexpected character"),
-        ("[x.y]", "expected `]`"),
-        ("1 2", "end of formula"),
+        'ANSWER(MONEY($7."x"))',  # handle not retrieved
+        'ANSWER(MONEY($0."x"))',
+        "Revenue was $4.82 million.",  # prose
+        'ANSWER(BOGUS($1."x"))',  # unknown function
+        'ANSWER(FIND(nope:"x"))',  # unknown kwarg
+        'NOT_FOUND("x", searched:[$6])',
     ],
 )
-def test_parse_errors_are_specific(src, fragment):
-    with pytest.raises(ParseError) as e:
-        parse_formula(src)
-    assert fragment in e.value.message
+def test_grammar_rejects(grammar5: Grammar, src: str) -> None:
+    assert not grammar5.accepts(src)
 
 
-def test_deep_nesting_and_huge_input_are_rejected_cleanly():
-    with pytest.raises(ParseError):
-        parse_formula("(" * 200 + "1" + ")" * 200)
-    with pytest.raises(ParseError):
-        parse_formula("1+" * 20000 + "1")
+def test_grammar_without_candidates() -> None:
+    g = Grammar(build_gbnf([]))
+    assert g.accepts('NOT_FOUND("nothing matched")')
+    assert not g.accepts('ANSWER(MONEY($1."x"))')
+    assert g.accepts('ANSWER(COUNT(FIND(match:"x")))')
 
 
-def test_lexer_unicode_escape():
-    assert lex('"\\u00e9"')[0].value == "é"
+@settings(max_examples=100, deadline=None)
+@given(st.lists(exprs, min_size=1, max_size=2))
+def test_grammar_accepts_unparsed_asts(es: list[A.Node]) -> None:
+    es = [e for e in es]
+    text = A.unparse(A.Answer(tuple(es), None))
+    g = Grammar(build_gbnf(range(1, 31)))
+    assert g.accepts(text), text
 
 
-# ---------------------------------------------------------------- typechecking
+def test_arg_refs_parse_and_unparse() -> None:
+    from spanql.formula.ast import ArgRef, walk
+
+    f = parse('ANSWER(COUNT(FIND(match:"a")), COUNT(FIND(match:"b")), PCT([0], [1], places:1))')
+    refs = [n for n in walk(f) if isinstance(n, ArgRef)]
+    assert [r.index for r in refs] == [0, 1]
+    assert "PCT([0], [1], places:1)" in A.unparse(f)
+    assert parse(A.unparse(f)) == f
 
 
-def test_types_of_spec_examples():
-    assert types('DIFF(MONEY($1."$4.82 million"), MONEY($2."$4.31M"))') == ["Number"]
-    assert types('COUNT(FIND(src:"x", re:"E"))') == ["Number"]
-    assert types('DIFF(DATE($1), DATE($2))') == ["Duration"]
-    assert types('DISTINCT(SYMBOLS(src:"r/**/*.py", kind:"function", calls:"f"))') == ["SpanSet"]
-    assert types('MAX(COLUMN("d", src:"x.csv"), as:"date")') == ["Date"]
-    assert types('SUM(COLUMN("amount", src:"x.csv"))') == ["Number"]
-    assert types('IF(AFTER(DATE($1), DATE($2)), NUM($3), NUM($4))') == ["Number"]
-    assert types("NUM($1)", ) == ["Number"] and types("$1") == ["Span"]
-    assert types('GT(NUM($1), 5) ') == ["Bool"]
-    assert types('DATE($1) + DURATION($2)') == ["Date"]
+def test_arg_refs_expand_to_self_contained_values() -> None:
+    from spanql.formula.ast import Answer, ArgRef, expand_arg_refs, walk
 
-
-def test_cellrefs_must_point_backwards():
-    assert types("ANSWER(COUNT(FIND(src:\"a\")), COUNT(FIND(src:\"b\")), PCT([0], [1], places:1))") == ["Number"] * 3
-    with pytest.raises(FormulaTypeError) as e:
-        types("ANSWER(PCT([1], [0]), NUM($1))")
-    assert "EARLIER" in e.value.message
-    with pytest.raises(FormulaTypeError):
-        types("ANSWER([c_nope])")
-    assert types("ANSWER([c_ok])", cell_type=lambda k: "Number" if k == "c_ok" else None) == ["Number"]
+    f = parse("ANSWER(MONEY($1), MONEY($2), DIFF([0], [1]), PCT([2], [1], places:1))")
+    assert isinstance(f, Answer)
+    g = expand_arg_refs(f)
+    assert not any(isinstance(n, ArgRef) for n in walk(g))
+    assert A.unparse(g.exprs[3]) == "PCT(DIFF(MONEY($1), MONEY($2)), MONEY($2), places:1)"
 
 
 @pytest.mark.parametrize(
-    "src, fragment",
-    [
-        ('NUM("5")', "extractors read a source span"),
-        ('SUM($1, $2)', "wrap it in NUM"),
-        ('DIFF(NUM($1), DATE($2))', "same type"),
-        ('BOGUS($1)', "unknown function BOGUS"),
-        ('COUNT_(FIND())', "unknown function"),
-        ('count($1)', "did you mean COUNT"),
-        ('NUM($1, 3)', "takes 1 argument"),
-        ('NUM($1, bogus:"x")', "no keyword `bogus:`"),
-        ('SUM(COLUMN("a", src:"x"), as:"weird")', "`as:` must be one of"),
-        ('FIELD("status")', "only works inside"),
-        ('FIND(src:"a", FIELD("x") >= NUM($1))', "compare FIELD"),
-        ('FIND(src:"a", NUM($1))', "true/false conditions"),
-        ('NUM($1) + DATE($2)', "cannot compute Number + Date"),
-        ('IF(NUM($1), 1, 2)', "must be Bool"),
-        ('IF(GT(NUM($1),1), NUM($2), DATE($3))', "same type"),
-        ('GT(NUM($1), DATE($2))', "cannot compare"),
-        ('SUM(NUM($1), DATE($2))', "same type"),
-        ('SUM(DATE($1), DATE($2))', "cannot add dates"),
-        ('LINES(from:1, to:2)', "needs src"),
-        ('COLUMN(src:"x")', "at least 1"),
-        ('ANSWER(NUM($1), text:"{3}")', "does not exist"),
-        ('ANSWER(NUM($1), text:"a {b} c")', "only contain placeholders"),
-        ('$1 == 5', "cannot compare"),
-        ('-DATE($1)', "unary minus"),
-    ],
+    "formula", ["ANSWER([0])", "ANSWER(MONEY($1), [1])", "ANSWER(MONEY($1), PCT([2], [0]))"]
 )
-def test_type_errors_are_specific(src, fragment):
-    with pytest.raises(FormulaTypeError) as e:
-        types(src)
-    assert fragment in " | ".join(e.value.problems), e.value.problems
+def test_arg_refs_must_point_backwards(formula: str) -> None:
+    from spanql.formula.ast import Answer, ArgRefError, expand_arg_refs
+
+    f = parse(formula)
+    assert isinstance(f, Answer)
+    with pytest.raises(ArgRefError):
+        expand_arg_refs(f)
 
 
-def test_all_problems_reported_at_once():
-    with pytest.raises(FormulaTypeError) as e:
-        types('ANSWER(NUM("x"), BOGUS($1), DIFF(NUM($1), DATE($2)))')
-    assert len(e.value.problems) == 3
-    assert "[V1]" in e.value.feedback()
+def test_grammar_accepts_arg_refs(grammar5: Grammar) -> None:
+    assert grammar5.accepts('ANSWER(MONEY($1."x"), MONEY($2."y"), PCT([0], [1], places:1))')

@@ -1,207 +1,285 @@
-"""The agent loop (HARNESS.md section 1): a bounded, fixed-toolset pipeline, not an open-ended agent.
-
-retrieve -> prompt -> formula -> verify (V1-V6) -> [retry with the exact error] -> render or refuse.
-The model never runs commands, never reads files, and never writes a final value.
-"""
+"""The bounded agent loop (docs/HARNESS.md §1)."""
 
 from __future__ import annotations
 
-import json
-import secrets
-import string
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date
+from typing import Any
 
-from ..engine import Engine, Evaluation, HandleTable
-from ..errors import SpanqlError
-from ..formula.gbnf import build_gbnf
-from ..retrieve import Retrieval, retrieve
-from ..store import Store, utc_now
-from ..verify import RelevanceChecker, verify_formula
-from .client import ClientError, ModelClient, extract_formula
-from .prompts import SYSTEM, build_user_prompt, retry_message
+from spanql.config import HarnessConfig
+from spanql.engine.run import Outcome, evaluate_formula
+from spanql.formula.gbnf import build_gbnf
+from spanql.harness.backends import Backend, BackendError
+from spanql.harness.prompts import build_messages
+from spanql.retrieve.retriever import Retrieval, Retriever
+from spanql.store.db import Store
 
-
-class HarnessError(Exception):
-    """The question could not be processed at all (e.g. no model configured, endpoint down)."""
+Event = Callable[[str, dict[str, Any]], None]
 
 
-@dataclass(slots=True)
-class HarnessConfig:
-    max_attempts: int = 3
-    candidate_token_budget: int = 8192
-    relevance_check: bool = True
-    k: int = 40
-    max_seconds: float = 30.0
-    max_tokens: int = 700
+@dataclass
+class Attempt:
+    n: int
+    formula: str
+    status: str
+    problems: list[dict[str, Any]]
+    seconds: float
+    raw: str | None = None
 
-
-@dataclass(slots=True)
-class AskResult:
-    status: str  # grounded | not_found | ambiguous
-    text: str
-    run_id: str
-    attempts: int
-    cells: list[dict] = field(default_factory=list)
-    message: str | None = None
-    conflicts: list[dict] = field(default_factory=list)
-    search_report: dict = field(default_factory=dict)
-    errors: list[dict] = field(default_factory=list)  # one verifier failure per failed attempt
-    elapsed_ms: int = 0
-
-    def to_json(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "answer": {"text": self.text, "cells": [c["id"] for c in self.cells]}, "status": self.status,
-            "attempts": self.attempts, "run_id": self.run_id, "message": self.message, "conflicts": self.conflicts,
-            "search_report": self.search_report, "errors": self.errors, "elapsed_ms": self.elapsed_ms,
-            "cells": self.cells,
+            "n": self.n,
+            "formula": self.formula,
+            "status": self.status,
+            "problems": self.problems,
+            "seconds": round(self.seconds, 3),
         }
 
 
-def _rid() -> str:
-    return "r_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
+@dataclass
+class AskResult:
+    run_id: str
+    question: str
+    status: str  # grounded | not_found | ambiguous | error (the backend failed; no answer)
+    answer: str
+    cells: list[dict[str, Any]] = field(default_factory=list)
+    formula: str | None = None
+    attempts: list[Attempt] = field(default_factory=list)
+    search_report: dict[str, Any] = field(default_factory=dict)
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    reason: str | None = None
+    refusal_by: str | None = None  # model | harness
+    conflicting: list[str] = field(default_factory=list)
+    model: dict[str, Any] = field(default_factory=dict)
+    seconds: float = 0.0
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "question": self.question,
+            "status": self.status,
+            "answer": {"text": self.answer, "cells": [c["id"] for c in self.cells]},
+            "cells": self.cells,
+            "formula": self.formula,
+            "attempts": len(self.attempts),
+            "attempt_log": [a.to_dict() for a in self.attempts],
+            "search_report": self.search_report,
+            "candidates": self.candidates,
+            "reason": self.reason,
+            "refusal_by": self.refusal_by,
+            "conflicting": self.conflicting,
+            "model": self.model,
+            "seconds": round(self.seconds, 3),
+            "error": self.error,
+        }
 
 
 class Harness:
-    def __init__(self, store: Store, client: ModelClient | None, config: HarnessConfig | None = None,
-                 engine: Engine | None = None):
+    def __init__(self, store: Store, backend: Backend, cfg: HarnessConfig | None = None):
         self.store = store
-        self.client = client
-        self.config = config or HarnessConfig()
-        self.engine = engine or Engine(store)
+        self.backend = backend
+        self.cfg = cfg or HarnessConfig()
+        self.retriever = Retriever(store, self.cfg.max_candidates, self.cfg.candidate_token_budget)
 
-    # -------------------------------------------------------------------- ask
-    def ask(self, question: str, *, scope: list[str] | None = None, conversation_id: str | None = None,
-            today: date | None = None) -> AskResult:
-        if not question or not question.strip():
-            raise HarnessError("empty question")
+    def ask(
+        self,
+        question: str,
+        *,
+        scope: list[str] | None = None,
+        history: list[dict[str, str]] | None = None,
+        prior_cells: list[dict[str, Any]] | None = None,
+        on_event: Event | None = None,
+    ) -> AskResult:
         t0 = time.monotonic()
-        run_id = _rid()
-        today = today or date.today()
-        if not self.store.list_sources():
-            return self._record(AskResult(
-                "not_found", "I couldn't find this in your sources: nothing has been ingested yet. "
-                             "Run `spanql ingest <path>` first.", run_id, 0,
-                message="no sources ingested"), question, {}, t0, conversation_id, scope)
-        if self.client is None:
-            raise HarnessError("no model is configured; set [model] endpoint in config.toml (see docs/DEPLOYMENT.md)")
+        run_id = "r_" + uuid.uuid4().hex[:12]
+        emit = on_event or (lambda kind, data: None)
+        model_info = {"backend": self.backend.name, "id": self.backend.model}
 
-        cfg = self.config
-        ret = retrieve(self.store, question, scope=scope, k=cfg.k, token_budget=cfg.candidate_token_budget, today=today)
-        user_prompt = build_user_prompt(question, ret, today)
-        messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user_prompt}]
-        grammar = build_gbnf(len(ret.candidates))
-        relevance = RelevanceChecker(self.client, self.store) if cfg.relevance_check else None
-        attempts: list[dict] = []
-        errors: list[dict] = []
-        result: AskResult | None = None
+        retrieval = self.retriever.search(question, scope=scope)
+        emit("retrieval", retrieval.to_dict())
+        attempts: list[Attempt] = []
+        outcome: Outcome | None = None
+        feedback: str | None = None
+        last_formula: str | None = None
+        k = self.cfg.max_candidates
+        backend_error: str | None = None
 
-        for n in range(1, cfg.max_attempts + 1):
-            if n > 1 and time.monotonic() - t0 > cfg.max_seconds:
+        for n in range(1, max(1, self.cfg.max_attempts) + 1):
+            if time.monotonic() - t0 > self.cfg.wall_clock_s and attempts:
                 break
+            grammar = build_gbnf(list(retrieval.handles)) if self.backend.supports_grammar else None
+            messages = build_messages(
+                question,
+                retrieval.handles,
+                retrieval.hints,
+                history=history,
+                feedback=feedback,
+                last_formula=last_formula,
+                prior_cells=prior_cells,
+            )
+            ta = time.monotonic()
             try:
-                raw = self.client.complete(messages, grammar=grammar, max_tokens=cfg.max_tokens)
-            except ClientError as e:
-                raise HarnessError(str(e)) from e
-            formula = extract_formula(raw)
-            rec: dict = {"attempt": n, "raw": raw, "formula": formula}
-            attempts.append(rec)
-            try:
-                ev = verify_formula(self.engine, formula, ret.handles, question=question, relevance=relevance,
-                                    question_id=run_id, model={"id": self.client.model_id, "formula_attempt": n})
-            except SpanqlError as e:
-                rec["error"] = e.to_json()
-                errors.append({"attempt": n, **e.to_json()})
-                messages += [{"role": "assistant", "content": raw},
-                             {"role": "user", "content": retry_message(e.feedback())}]
-                continue
-            except ClientError as e:  # relevance check could not reach the model
-                raise HarnessError(str(e)) from e
-            rec["outcome"] = ev.kind
-            result = self._finish(ev, ret, run_id, n, errors)
-            break
+                # deterministic first try; a little more exploration on retries so a repeated
+                # rejected formula isn't regenerated verbatim
+                temp = None if n == 1 else min(0.3 * (n - 1), 0.8)
+                gen = self.backend.generate(
+                    messages,
+                    grammar=grammar,
+                    question=question,
+                    handles=retrieval.handles,
+                    hints=retrieval.hints,
+                    temperature=temp,
+                )
+            except BackendError as exc:
+                backend_error = str(exc)
+                emit("error", {"message": backend_error})
+                break
+            relevance = self.backend.relevant if self.cfg.relevance_check else None
+            outcome = evaluate_formula(
+                self.store,
+                gen.text,
+                retrieval.handles,
+                question=question,
+                relevance=relevance,
+                model_info={**model_info, "formula_attempt": n},
+                question_id=run_id,
+            )
+            att = Attempt(
+                n,
+                gen.text,
+                outcome.status,
+                [p.to_dict() for p in outcome.problems],
+                time.monotonic() - ta,
+                raw=str(gen.raw) if gen.raw is not None else None,
+            )
+            attempts.append(att)
+            emit("attempt", att.to_dict())
+            if outcome.ok:
+                break
+            emit("verifier", {"attempt": n, "problems": att.problems})
+            feedback, last_formula = outcome.feedback(), gen.text
+            # widen retrieval between attempts when the problem might be missing context
+            if any(p.code in ("V2", "V5", "V6") for p in outcome.problems):
+                k = min(k * 2, 40)
+                retrieval = self._widen(question, scope, k, retrieval)
 
-        if result is None:
-            result = self._exhausted(ret, run_id, len(attempts), errors)
-        record = {"user_prompt": user_prompt, "attempts": attempts, "model": self.client.model_id,
-                  "retrieval": {**ret.report(), "candidates_full": [c.to_json() for c in ret.candidates],
-                                "date_hints": ret.date_hints}}
-        return self._record(result, question, record, t0, conversation_id, scope)
-
-    # --------------------------------------------------------------- outcomes
-    def _finish(self, ev: Evaluation, ret: Retrieval, run_id: str, attempt: int, errors: list[dict]) -> AskResult:
-        report = ret.report()
-        if ev.kind == "answer":
-            cells = [c.to_json() for c in ev.cells]
-            self.store.save_cells(cells)
-            return AskResult("grounded", ev.render(), run_id, attempt, cells=cells, search_report=report, errors=errors)
-        if ev.kind == "ambiguous":
-            conflicts = [self._span_info(s) for s in ev.spans]
-            lines = [ev.message or "The sources conflict."] + [
-                f"- {c['source']} {c['lines']}: \"{c['text']}\"" for c in conflicts]
-            return AskResult("ambiguous", "\n".join(lines), run_id, attempt, message=ev.message, conflicts=conflicts,
-                             search_report=report, errors=errors)
-        return AskResult("not_found", self._refusal_text(ev.message, ret), run_id, attempt, message=ev.message,
-                         search_report=report, errors=errors)
-
-    def _exhausted(self, ret: Retrieval, run_id: str, attempts: int, errors: list[dict]) -> AskResult:
-        report = ret.report()
-        report["attempt_errors"] = [{"attempt": e["attempt"], "check": e["check"], "message": e["message"]}
-                                    for e in errors]
-        checks = ", ".join(sorted({e["check"] for e in errors})) or "none"
-        msg = f"No formula that passes verification could be built from your sources (failed checks: {checks})."
-        return AskResult("not_found", self._refusal_text(msg, ret), run_id, attempts, message=msg,
-                         search_report=report, errors=errors)
-
-    def _refusal_text(self, message: str | None, ret: Retrieval) -> str:
-        terms = ", ".join(f'"{t}"' for t in ret.terms[:8]) or "your question"
-        out = [f"I couldn't find this in your sources. I searched {ret.sources_searched} source(s) "
-               f"({ret.blocks_searched} blocks) for {terms}."]
-        if message:
-            out.append(message)
-        near = ret.candidates[:3] or ret.near_misses[:3]
-        if near:
-            out.append("Closest passages:")
-            out += [f"- {c.uri} {c.location()}: \"{c.excerpt[:140]}\"" for c in near]
-        return "\n".join(out)
-
-    def _span_info(self, span) -> dict:
-        loc = self.store.locate(span)
-        text = " ".join(self.store.span_text(span).split())
-        return {"span": span.id, "source": loc.sources[0] if loc.sources else None,
-                "lines": f"L{loc.line_start}" if loc.line_start == loc.line_end else f"L{loc.line_start}-L{loc.line_end}",
-                "text": text if len(text) <= 160 else text[:159] + "…"}
-
-    # ---------------------------------------------------------------- records
-    def _record(self, result: AskResult, question: str, record: dict, t0: float, conversation_id, scope) -> AskResult:
-        result.elapsed_ms = int((time.monotonic() - t0) * 1000)
-        record = {**record, "conversation_id": conversation_id, "scope": scope, "text": result.text,
-                  "errors": result.errors}
-        with self.store.transaction() as db:
-            db.execute(
-                "INSERT INTO run(id, created_at, question, status, attempts, elapsed_ms, record) VALUES (?,?,?,?,?,?,?)",
-                (result.run_id, utc_now(), question, result.status, result.attempts, result.elapsed_ms,
-                 json.dumps(record, ensure_ascii=False)))
+        result = self._finish(
+            run_id, question, retrieval, attempts, outcome, model_info, backend_error
+        )
+        result.seconds = time.monotonic() - t0
+        if result.status == "grounded":
+            for cell in result.cells:
+                self.store.save_cell(cell, run_id)
+                emit("cell", cell)
+        emit("answer", result.to_dict())
+        record = result.to_dict()
+        record["attempt_log"] = [dict(a.to_dict(), raw=a.raw) for a in attempts]
+        self.store.save_run(run_id, question, result.status, record)
         return result
 
+    def _widen(self, question: str, scope: list[str] | None, k: int, prev: Retrieval) -> Retrieval:
+        wider = self.retriever.search(question, scope=scope, k=k)
+        # keep existing handle numbers stable; append new candidates after them
+        merged = dict(prev.handles)
+        known = {h.span for h in merged.values()}
+        for h in wider.handles.values():
+            if h.span not in known:
+                h.n = len(merged) + 1
+                merged[h.n] = h
+        wider.handles = merged
+        return wider
 
-def list_runs(store: Store, limit: int = 20) -> list[dict]:
-    rows = store.db.execute(
-        "SELECT id, created_at, question, status, attempts, elapsed_ms FROM run ORDER BY created_at DESC, rowid DESC "
-        "LIMIT ?", (limit,)).fetchall()
-    return [dict(r) for r in rows]
+    def _finish(
+        self,
+        run_id: str,
+        question: str,
+        retrieval: Retrieval,
+        attempts: list[Attempt],
+        outcome: Outcome | None,
+        model_info: dict[str, Any],
+        backend_error: str | None,
+    ) -> AskResult:
+        report = dict(retrieval.report)
+        report["attempts"] = len(attempts)
+        cands = [h.to_dict() for h in retrieval.handles.values()]
+        base: dict[str, Any] = {
+            "run_id": run_id,
+            "question": question,
+            "attempts": attempts,
+            "search_report": report,
+            "candidates": cands,
+            "model": model_info,
+        }
+        if outcome is not None and outcome.status == "grounded":
+            return AskResult(
+                status="grounded",
+                answer=outcome.answer or "",
+                cells=outcome.cells,
+                formula=outcome.formula,
+                **base,
+            )
+        if outcome is not None and outcome.status == "ambiguous":
+            text = (
+                f"Your sources disagree: {outcome.reason} "
+                f"See {len(outcome.handles)} conflicting passages."
+            )
+            return AskResult(
+                status="ambiguous",
+                answer=text,
+                formula=outcome.formula,
+                reason=outcome.reason,
+                refusal_by="model",
+                conflicting=outcome.handles,
+                **base,
+            )
+        if outcome is not None and outcome.status == "not_found":
+            reason = outcome.reason or ""
+            return AskResult(
+                status="not_found",
+                answer=self._refusal_text(reason, report),
+                formula=outcome.formula,
+                reason=reason,
+                refusal_by="model",
+                **base,
+            )
+        if backend_error:
+            # an unreachable or broken model is an operational error, not "the answer isn't in
+            # your sources": reporting it as a refusal would make an outage look like a fact
+            return AskResult(
+                status="error",
+                answer=f"No answer: the model backend failed ({backend_error}). "
+                "This says nothing about your sources; check the model endpoint and retry.",
+                formula=attempts[-1].formula if attempts else None,
+                reason=f"model backend failed: {backend_error}",
+                error=backend_error,
+                **base,
+            )
+        if attempts:
+            last = attempts[-1].problems
+            reason = (
+                f"no formula passed verification after {len(attempts)} attempt(s); last "
+                f"error: {last[0]['message'] if last else 'unknown'}"
+            )
+        else:
+            reason = "no attempts were made"
+        report["last_problems"] = attempts[-1].problems if attempts else []
+        return AskResult(
+            status="not_found",
+            answer=self._refusal_text(reason, report),
+            formula=attempts[-1].formula if attempts else None,
+            reason=reason,
+            refusal_by="harness",
+            **base,
+        )
 
-
-def evaluate_formula(store: Store, formula: str, handles: dict[str, str] | None = None, *, question: str | None = None,
-                     verify: bool = True, save: bool = True) -> Evaluation:
-    """Power-user / test entry (``POST /v1/evaluate``): evaluate a hand-written formula.
-
-    ``verify`` applies the V4 literal policy; V1-V3 and V5 always apply.
-    """
-    engine = Engine(store)
-    table = HandleTable.from_ids(store, handles or {})
-    ev = verify_formula(engine, formula, table, question=question, strict_literals=verify)
-    if save and ev.cells:
-        store.save_cells([c.to_json() for c in ev.cells])
-    return ev
+    @staticmethod
+    def _refusal_text(reason: str, report: dict[str, Any]) -> str:
+        kw = ", ".join(f'"{w}"' for w in report.get("keywords", [])[:6]) or "(no keywords)"
+        return (
+            f"I couldn't find this in your sources. I searched "
+            f"{report.get('blocks_searched', 0)} passages in "
+            f"{report.get('sources_searched', 0)} sources for {kw}. {reason}".strip()
+        )

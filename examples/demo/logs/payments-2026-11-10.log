@@ -1,0 +1,10 @@
+2026-11-10T08:00:01Z INFO payments.api: request ok status=200 latency_ms=41
+2026-11-10T08:00:05Z ERROR payments.api: PaymentTimeout after 30s order=A100 status=504 latency_ms=30000
+2026-11-10T08:01:12Z WARN payments.retry: retrying order=A100 attempt=2
+2026-11-10T08:02:00Z ERROR payments.db: connection reset status=500 latency_ms=12
+Traceback (most recent call last):
+  File "db.py", line 10, in connect
+ConnectionResetError: reset by peer
+2026-11-10T09:15:44Z ERROR payments.api: PaymentTimeout after 30s order=B220 status=504 latency_ms=30001
+2026-11-10T10:30:00Z INFO payments.api: request ok status=200 latency_ms=38
+2026-11-11T00:00:02Z ERROR payments.api: PaymentTimeout after 30s order=C310 status=504 latency_ms=30000

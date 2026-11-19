@@ -1,3 +1,3 @@
-from .server import check_bind_security, make_server
+from spanql.api.app import create_app
 
-__all__ = ["make_server", "check_bind_security"]
+__all__ = ["create_app"]

@@ -1,5 +1,7 @@
 # Model
 
+> **Implementation note (2026-11-19):** the first implementation differs from this document in a few places (snapshot ids, `match:` keyword, comparisons in the grammar, Starlette/argparse, runtime defaults, Docker/Homebrew details). See [ADR-0007](adr/0007-implementation-deviations.md).
+
 > Design phase. Model facts below were checked against model cards and repositories on 2026-11-17. No spanql-specific benchmark has been run yet; every quality number in this repo will come from the eval harness in §5, not from vendor leaderboards.
 
 ## 1. What the model has to do

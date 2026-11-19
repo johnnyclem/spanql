@@ -1,375 +1,391 @@
-"""Deterministic extractors: NUM, MONEY, PCT_OF, DATE, DATETIME, DURATION, TEXT, BOOL.
+"""Deterministic extraction parsers: NUM, MONEY, PCT_OF, DATE, DATETIME, DURATION, BOOL.
 
-Each parses text from a span with fixed, locale-aware rules and records *which
-characters it consumed* so the trace can highlight exactly them. Failure is an
-:class:`ExtractError` (verifier check V3); nothing is ever guessed: no assumed
-year, no assumed currency, no choosing between several numbers.
+Each parser finds *exactly one* match in its input or fails (never guesses), and reports the
+character range it consumed so the trace can highlight it.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
-from ..errors import ExtractError
-from ..ingest.logs import parse_iso_ts
-from .format import plain
-from .values import BoolV, CTX, DateTimeV, DateV, DurationV, Number, Text, Value
+from spanql.engine.errors import extraction
 
-MONTHS = {m: i for i, m in enumerate(
-    "january february march april may june july august september october november december".split(), 1)}
-_MONTH_RX = (r"(?P<mon>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|"
-             r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?")
+SCALES = {
+    "thousand": Decimal(1_000),
+    "k": Decimal(1_000),
+    "K": Decimal(1_000),
+    "million": Decimal(1_000_000),
+    "mn": Decimal(1_000_000),
+    "M": Decimal(1_000_000),
+    "MM": Decimal(1_000_000),
+    "mm": Decimal(1_000_000),
+    "billion": Decimal(1_000_000_000),
+    "bn": Decimal(1_000_000_000),
+    "B": Decimal(1_000_000_000),
+    "trillion": Decimal(10) ** 12,
+    "tn": Decimal(10) ** 12,
+    "T": Decimal(10) ** 12,
+}
+CURRENCY_SYMBOLS = {
+    "$": "USD",
+    "US$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+    "₹": "INR",
+    "C$": "CAD",
+    "A$": "AUD",
+}
+CURRENCY_CODES = {"USD", "EUR", "GBP", "JPY", "CAD", "AUD", "CHF", "CNY", "INR", "MXN", "BRL"}
+UNITS = {
+    "%": "%",
+    "percent": "%",
+    "pct": "%",
+    "ms": "ms",
+    "s": "s",
+    "sec": "s",
+    "secs": "s",
+    "seconds": "s",
+    "second": "s",
+    "min": "min",
+    "mins": "min",
+    "minutes": "min",
+    "minute": "min",
+    "h": "h",
+    "hr": "h",
+    "hrs": "h",
+    "hours": "h",
+    "hour": "h",
+    "days": "days",
+    "day": "days",
+    "d": "days",
+    "KB": "KB",
+    "MB": "MB",
+    "GB": "GB",
+    "TB": "TB",
+    "kb": "KB",
+    "mb": "MB",
+    "gb": "GB",
+    "x": "x",
+}
 
-# (thousands separator class, decimal separator)
-LOCALES = {"en": (",", "."), "de": (".", ","), "fr": ("[   ]", ",")}
+_SYM = r"(?:US\$|C\$|A\$|\$|€|£|¥|₹)"
+_CODE = r"(?:" + "|".join(sorted(CURRENCY_CODES)) + r")"
+_NUM = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+"
+_SCALE = r"(?:thousand|million|billion|trillion|mn|bn|tn|MM|mm|[kKMBT])"
+_UNIT = r"(?:%|percent|pct|ms|seconds?|secs?|s|minutes?|mins?|min|hours?|hrs?|hr|h|days?|d|[KMGT]B|[kmg]b|x)"
 
-CURRENCY_SYMBOLS = {"US$": "USD", "C$": "CAD", "A$": "AUD", "NZ$": "NZD", "HK$": "HKD", "S$": "SGD", "$": "USD",
-                    "€": "EUR", "£": "GBP", "¥": "JPY", "₹": "INR", "₩": "KRW", "₽": "RUB"}
-CURRENCY_CODES = set(
-    "USD EUR GBP JPY CNY CAD AUD NZD CHF SEK NOK DKK PLN CZK HUF INR KRW BRL MXN ZAR SGD HKD TWD THB IDR MYR PHP "
-    "TRY ILS AED SAR RUB UAH ARS CLP COP PEN EGP NGN KES".split())
-CURRENCY_WORDS = {"dollar": "USD", "dollars": "USD", "euro": "EUR", "euros": "EUR", "pound": "GBP", "pounds": "GBP",
-                  "yen": "JPY"}
-_SYMS = "|".join(re.escape(s) for s in sorted(CURRENCY_SYMBOLS, key=len, reverse=True))
-_MAG = {"thousand": 3, "k": 3, "million": 6, "m": 6, "mn": 6, "mm": 6, "billion": 9, "b": 9, "bn": 9, "trillion": 12}
-
-
-@dataclass(slots=True)
-class Parsed:
-    value: Value
-    consumed: tuple[int, int]  # char offsets into the span text
-    info: dict = field(default_factory=dict)
+QUANTITY_RE = re.compile(
+    rf"(?<![\w.$€£¥₹])(?P<neg>-|−|\()?\s?(?P<sym>{_SYM})?\s?(?P<code1>{_CODE}\s)?"
+    rf"(?P<neg2>-|−)?(?P<num>{_NUM})"
+    rf"(?:\s?(?P<scale>{_SCALE})(?![A-Za-z]))?"
+    rf"(?:\s?(?P<unit>{_UNIT})(?![A-Za-z]))?"
+    rf"(?:\s(?P<code2>{_CODE}))?(?P<close>\))?"
+    rf"(?![\w])"
+)
 
 
-def _clip(text: str, n: int = 80) -> str:
-    t = " ".join(text.split())
-    return t if len(t) <= n else t[: n - 1] + "…"
+@dataclass
+class Extracted:
+    value: Any
+    unit: str | None
+    start: int  # char offsets within the input text
+    end: int
+    parsed: dict[str, Any]
 
 
-def _locale(name: str | None) -> tuple[str, str]:
-    key = (name or "en").lower()
-    if key not in LOCALES:
-        raise ExtractError(f"unknown locale {name!r}; supported: {', '.join(LOCALES)}")
-    return LOCALES[key]
+# the full run of digits and separators a number token sits in ("1.234,50")
+_RUN_RE = re.compile(r"[\d.,]*\d")
 
 
-# ---------------------------------------------------------------- numbers
+def _quantities(text: str) -> list[re.Match[str]]:
+    out = []
+    covered = -1  # end of the last unreadable separator run; its pieces aren't separate numbers
+    for m in QUANTITY_RE.finditer(text):
+        if m.start("num") < covered:
+            continue
+        # skip things that look like parts of dates/times/versions/identifiers
+        a, b = m.start("num"), m.end("num")
+        before = text[max(0, a - 1) : a]
+        after = text[b : b + 1]
+        if before in ("-", "/", ":") and not m.group("neg") and not m.group("neg2"):
+            continue
+        if after in ("/", ":") or (after == "-" and text[b + 1 : b + 2].isdigit()):
+            continue
+        if after == "." and text[b + 1 : b + 2].isdigit():
+            continue  # version like 1.2.3
+        run = _RUN_RE.match(text, a)
+        if run is not None and run.end() > b and _separator_run(run.group(0)):
+            covered = run.end()
+        out.append(m)
+    return out
 
 
-def _number_rx(locale: str | None, *, money: bool) -> re.Pattern[str]:
-    thou, dec = _locale(locale)
-    thou_rx = thou if thou.startswith("[") else re.escape(thou)
-    dec_rx = re.escape(dec)
-    lo = "kmb" if money else "k"  # lowercase single-letter magnitudes are ambiguous outside money
-    return re.compile(
-        rf"""(?<![\w.,])
-            (?P<sign>[-−])?
-            (?P<int>\d{{1,3}}(?:{thou_rx}\d{{3}})+|\d+)
-            (?P<frac>{dec_rx}\d+)?
-            (?!\d)(?!{dec_rx}\d)(?!{thou_rx}\d)
-            (?:\s?(?P<word>thousand|million|billion|trillion)(?![A-Za-z])
-              |\s?(?P<abbr>[KMB]|bn|Bn|BN|mn|MM)(?![A-Za-z])
-              |(?P<lo>[{lo}])(?![A-Za-z]))?""",
-        re.VERBOSE,
-    )
+def _separator_run(run: str) -> bool:
+    """True for digit runs whose separators spanql won't guess at: European ``1.234,50``,
+    ``1.234.567``, decimal-comma ``12,5`` next to a decimal point, and similar."""
+    return ("," in run and "." in run) or run.count(".") > 1 or bool(re.search(r",\d{1,2}$", run))
 
 
-def _magnitude(m: re.Match[str]) -> int:
-    tok = m.group("word") or m.group("abbr") or m.group("lo")
-    return _MAG[tok.lower()] if tok else 0
+def _check_separators(m: re.Match[str], text: str) -> None:
+    a = m.start("num")
+    run = _RUN_RE.match(text, a)
+    if run is not None and run.end() > m.end("num") and _separator_run(run.group(0)):
+        raise extraction(
+            f"can't read {run.group(0)!r} unambiguously: its separators could mean thousands "
+            "or decimals (e.g. 1.234,50 = 1234.50 in many locales)",
+            hint="spanql reads numbers written like 1,234.50; quote a value written that way, "
+            "or answer NOT_FOUND / AMBIGUOUS",
+        )
 
 
-def _to_decimal(m: re.Match[str], locale: str | None) -> Decimal:
-    thou, dec = _locale(locale)
-    ip = re.sub(thou, "", m.group("int")) if thou.startswith("[") else m.group("int").replace(thou, "")
-    s = ip + ("." + m.group("frac")[1:] if m.group("frac") else "")
+def _one(matches: list[Any], what: str, text: str) -> Any:
+    if not matches:
+        raise extraction(
+            f"no {what} found in {text[:80]!r}", hint=f"quote the exact text containing the {what}"
+        )
+    if len(matches) > 1:
+        shown = ", ".join(repr(m.group(0).strip()) for m in matches[:4])
+        raise extraction(
+            f"{len(matches)} {what}s found in {text[:80]!r} ({shown})",
+            hint=f'quote only the {what} you mean, e.g. $n."…"',
+        )
+    return matches[0]
+
+
+def _to_decimal(num: str) -> Decimal:
     try:
-        v = Decimal(s)
-    except InvalidOperation as e:  # pragma: no cover - regex guarantees digits
-        raise ExtractError(f"cannot read {m.group(0)!r} as a number") from e
-    v = CTX.scaleb(v, _magnitude(m))
-    return -v if m.group("sign") else v
+        return Decimal(num.replace(",", ""))
+    except InvalidOperation as exc:  # pragma: no cover - regex guarantees digits
+        raise extraction(f"not a number: {num!r}") from exc
 
 
-def _paren_negative(text: str, start: int, end: int) -> bool:
-    return text[:start].rstrip().endswith("(") and text[end:].lstrip().startswith(")")
-
-
-def _no_or_many(kind: str, text: str, found: list[str], hint: str) -> ExtractError:
-    if not found:
-        return ExtractError(f"no {kind} found in {_clip(text)!r}", hint=hint)
-    return ExtractError(
-        f"found {len(found)} {kind}s ({', '.join(_clip(f, 30) for f in found[:5])}) in {_clip(text)!r}; "
-        f"I will not guess which one you mean",
-        hint="quote only the one you want, e.g. $1.\"4.82 million\"",
-    )
-
-
-def _currency_adjacent(before: str, after: str) -> bool:
-    """Is a currency symbol/code/word directly attached to a number?"""
-    if re.search(rf"(?:{_SYMS})\s?$", before):
-        return True
-    bm = re.search(r"\b([A-Z]{3})\s?$", before)
-    if bm and bm.group(1) in CURRENCY_CODES:
-        return True
-    am = re.match(r"\s?([A-Z]{3})\b", after)
-    if am and am.group(1) in CURRENCY_CODES:
-        return True
-    return bool(re.match(r"\s?(?:dollars?|euros?|pounds?|yen)\b", after, re.I))
-
-
-def extract_num(text: str, locale: str | None = None) -> Parsed:
-    rx = _number_rx(locale, money=False)
-    toks = list(rx.finditer(text))
-    if len(toks) != 1:
-        raise _no_or_many("number", text, [m.group(0) for m in toks], "the span must contain a number")
-    m = toks[0]
-    before, after = text[max(0, m.start() - 6) : m.start()], text[m.end() : m.end() + 12]
-    if _currency_adjacent(before, after):
-        raise ExtractError(f"{_clip(text)!r} has a currency; use MONEY(...) instead of NUM(...)")
-    if re.match(r"\s?(?:%|percent\b|per cent\b|pct\b)", after):
-        raise ExtractError(f"{_clip(text)!r} is a percentage; use PCT_OF(...) instead of NUM(...)")
-    v = _to_decimal(m, locale)
-    if _paren_negative(text, m.start(), m.end()):
-        v = -abs(v)
-    return Parsed(Number(v), (m.start(), m.end()), {"decimal": plain(v)})
-
-
-def extract_money(text: str, locale: str | None = None) -> Parsed:
-    rx = _number_rx(locale, money=True)
-    toks = list(rx.finditer(text))
-    if len(toks) != 1:
-        raise _no_or_many("amount", text, [m.group(0) for m in toks], "the span must contain an amount with a currency")
-    m = toks[0]
-    start, end = m.start(), m.end()
-    currency = None
-    before = text[:start]
-    bm = re.search(rf"(?P<neg>[-−])?(?P<cur>{_SYMS}|\b[A-Z]{{3}})\s?$", before)
-    if bm and (bm.group("cur") in CURRENCY_SYMBOLS or bm.group("cur") in CURRENCY_CODES):
-        currency = CURRENCY_SYMBOLS.get(bm.group("cur"), bm.group("cur"))
-        neg_prefix = bool(bm.group("neg"))
-        start = bm.start("neg") if neg_prefix else bm.start("cur")
+def parse_quantity(text: str, *, require: str | None = None) -> Extracted:
+    """Parse one number with optional currency/scale/unit. ``require`` is 'money' or '%'."""
+    ms = _quantities(text)
+    if require == "money":
+        ms = [m for m in ms if m.group("sym") or m.group("code1") or m.group("code2")]
+        m = _one(ms, "money amount", text)
+    elif require == "%":
+        ms = [m for m in ms if m.group("unit") and UNITS.get(m.group("unit")) == "%"]
+        m = _one(ms, "percentage", text)
     else:
-        neg_prefix = False
-    if currency is None:
-        am = re.match(r"\s?(?P<cur>[A-Z]{3}\b|dollars?\b|euros?\b|pounds?\b|yen\b)", text[end:])
-        if am:
-            cur = am.group("cur")
-            code = CURRENCY_WORDS.get(cur.lower()) if cur.islower() else cur
-            if code in CURRENCY_CODES:
-                currency, end = code, end + am.end()
-    if currency is None:
-        raise ExtractError(f"no currency symbol or code next to the amount in {_clip(text)!r}",
-                           hint="use NUM(...) for plain numbers; MONEY needs e.g. $, EUR or 'USD'")
-    v = _to_decimal(m, locale)
-    if neg_prefix or _paren_negative(text, start, end):
-        v = -abs(v)
-    return Parsed(Number(v, currency), (start, end), {"amount": plain(v), "currency": currency})
+        m = _one(ms, "number", text)
+    _check_separators(m, text)
+    value = _to_decimal(m.group("num"))
+    scale = m.group("scale")
+    # a lone uppercase letter like "M" after a number with no currency is still a scale;
+    # "5 m" (lowercase) is ambiguous (metres/minutes) and is not treated as a scale.
+    if scale:
+        value *= SCALES[scale]
+    has_currency = bool(m.group("sym") or m.group("code1") or m.group("code2"))
+    # accounting negatives "(1,234)" only for money or a bare table cell; "(12) items" is 12
+    paren_neg = (
+        m.group("neg") == "("
+        and m.group("close") == ")"
+        and (has_currency or text.strip() == m.group(0).strip())
+    )
+    neg = bool(m.group("neg2")) or m.group("neg") in ("-", "−") or paren_neg
+    if neg:
+        value = -value
+    currency = None
+    if m.group("sym"):
+        currency = CURRENCY_SYMBOLS[m.group("sym")]
+    elif m.group("code1") or m.group("code2"):
+        currency = (m.group("code1") or m.group("code2")).strip()
+    unit_tok = m.group("unit")
+    unit = UNITS.get(unit_tok) if unit_tok else None
+    if currency and unit and unit != "%":
+        unit = None
+    start = m.start()
+    if m.group("neg") == "(" and not paren_neg:
+        start = m.end("neg")
+    while start < m.end() and text[start].isspace():
+        start += 1
+    end = m.end()
+    if m.group("close") and not paren_neg:
+        end -= 1
+    return Extracted(
+        value,
+        currency or unit,
+        start,
+        end,
+        {
+            "amount": str(value),
+            "currency": currency,
+            "unit": unit,
+            "scale": scale,
+            "matched": text[start:end],
+        },
+    )
 
 
-def extract_pct(text: str, locale: str | None = None) -> Parsed:
-    rx = _number_rx(locale, money=False)
-    hits = []
-    for m in rx.finditer(text):
-        am = re.match(r"\s?(?:%|percent\b|per cent\b|pct\b)", text[m.end() :])
-        if am:
-            hits.append((m, m.end() + am.end()))
-    if len(hits) != 1:
-        raise _no_or_many("percentage", text, [text[m.start() : e] for m, e in hits],
-                          "the span must contain a number followed by % or 'percent'")
-    m, end = hits[0]
-    return Parsed(Number(_to_decimal(m, locale), "%"), (m.start(), end), {"decimal": plain(_to_decimal(m, locale))})
+MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"],
+        start=1,
+    )
+}
+MONTHS.update(
+    {
+        "sept": 9,
+        "january": 1,
+        "february": 2,
+        "march": 3,
+        "april": 4,
+        "june": 6,
+        "july": 7,
+        "august": 8,
+        "september": 9,
+        "october": 10,
+        "november": 11,
+        "december": 12,
+    }
+)
+_MON = r"(?P<mon>" + "|".join(sorted(MONTHS, key=len, reverse=True)) + r")\.?"
+DATE_PATTERNS = [
+    ("iso", re.compile(r"(?<!\d)(?P<y>\d{4})-(?P<m>\d{1,2})-(?P<d>\d{1,2})(?!\d)")),
+    ("ymd/", re.compile(r"(?<!\d)(?P<y>\d{4})/(?P<m>\d{1,2})/(?P<d>\d{1,2})(?!\d)")),
+    (
+        "mdy-name",
+        re.compile(rf"(?i)\b{_MON}\s+(?P<d>\d{{1,2}})(?:st|nd|rd|th)?,?\s+(?P<y>\d{{4}})\b"),
+    ),
+    (
+        "dmy-name",
+        re.compile(rf"(?i)\b(?P<d>\d{{1,2}})(?:st|nd|rd|th)?\s+{_MON},?\s+(?P<y>\d{{4}})\b"),
+    ),
+    ("slash", re.compile(r"(?<![\d/])(?P<a>\d{1,2})[/.](?P<b>\d{1,2})[/.](?P<y>\d{4})(?![\d/])")),
+    ("noyear", re.compile(rf"(?i)\b{_MON}\s+(?P<d>\d{{1,2}})(?:st|nd|rd|th)?\b(?!,?\s+\d{{4}})")),
+]
 
 
-# ------------------------------------------------------------------- dates
-
-
-def _mk_date(y: int, mo: int, d: int, text: str) -> date:
-    try:
-        return date(y, mo, d)
-    except ValueError as e:
-        raise ExtractError(f"{y:04d}-{mo:02d}-{d:02d} in {_clip(text)!r} is not a real calendar date") from e
-
-
-def _mon(name: str) -> int:
-    key = name.lower().rstrip(".")
-    for full, i in MONTHS.items():
-        if full.startswith(key[:3]) and (full.startswith(key) or key == "sept"):
-            return i
-    raise ExtractError(f"unknown month {name!r}")
-
-
-def extract_date(text: str, fmt: str | None = None, year: int | None = None) -> Parsed:
-    fmt = (fmt or "").upper() or None
-    if fmt not in (None, "MDY", "DMY", "YMD"):
-        raise ExtractError(f"unknown date fmt {fmt!r}; use 'MDY', 'DMY' or 'YMD'")
-    found: list[tuple[int, int, date]] = []
+def parse_date(text: str, fmt: str | None = None) -> Extracted:
+    found: list[tuple[int, int, date, str]] = []
     taken: list[tuple[int, int]] = []
 
-    def add(m: re.Match[str], d: date) -> None:
-        if not any(m.start() < e and s < m.end() for s, e in taken):
+    def overlaps(a: int, b: int) -> bool:
+        return any(a < y and x < b for x, y in taken)
+
+    for name, pat in DATE_PATTERNS:
+        for m in pat.finditer(text):
+            if overlaps(m.start(), m.end()):
+                continue
+            if name == "noyear":
+                raise extraction(
+                    f"date {m.group(0)!r} has no year",
+                    hint="quote text that includes the year; spanql never guesses years",
+                )
+            try:
+                if name in ("iso", "ymd/"):
+                    d = date(int(m["y"]), int(m["m"]), int(m["d"]))
+                elif name in ("mdy-name", "dmy-name"):
+                    d = date(int(m["y"]), MONTHS[m["mon"].lower().rstrip(".")], int(m["d"]))
+                else:
+                    a, b = int(m["a"]), int(m["b"])
+                    order = (fmt or "").upper()
+                    if order == "MDY" or (not order and b > 12 >= a):
+                        d = date(int(m["y"]), a, b)
+                    elif order == "DMY" or (not order and a > 12 >= b):
+                        d = date(int(m["y"]), b, a)
+                    else:
+                        raise extraction(
+                            f"date {m.group(0)!r} is ambiguous (month/day order)",
+                            hint='add format:"MDY" or format:"DMY" only if the source states it',
+                        )
+            except ValueError as exc:
+                raise extraction(f"invalid date {m.group(0)!r}: {exc}") from exc
+            found.append((m.start(), m.end(), d, name))
             taken.append((m.start(), m.end()))
-            found.append((m.start(), m.end(), d))
-
-    for m in re.finditer(r"(?<!\d)(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)", text):
-        add(m, _mk_date(int(m.group(1)), int(m.group(2)), int(m.group(3)), text))
-    for m in re.finditer(rf"\b{_MONTH_RX}\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b", text, re.I):
-        add(m, _mk_date(int(m.group(3)), _mon(m.group("mon")), int(m.group(2)), text))
-    for m in re.finditer(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?[\s\-]+(?:of\s+)?{_MONTH_RX},?[\s\-]+(\d{{4}})\b", text, re.I):
-        add(m, _mk_date(int(m.group(3)), _mon(m.group("mon")), int(m.group(1)), text))
-    for m in re.finditer(r"(?<![\d/.\-])(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})(?![\d/.\-])", text):
-        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        order = fmt
-        if order is None:
-            if a > 12 and b <= 12:
-                order = "DMY"
-            elif b > 12 and a <= 12:
-                order = "MDY"
-            elif a == b:
-                order = "MDY"
-            else:
-                raise ExtractError(f"{m.group(0)!r} is ambiguous (month-first or day-first)",
-                                   hint="pass fmt:\"MDY\" or fmt:\"DMY\", or quote a date written with a month name")
-        mo, d = (a, b) if order == "MDY" else (b, a)
-        add(m, _mk_date(y, mo, d, text))
-    if not found:
-        for m in list(re.finditer(rf"\b{_MONTH_RX}\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", text, re.I)):
-            d = int(m.group(2))
-            if year is None:
-                raise ExtractError(f"{m.group(0)!r} has no year", hint="quote a span that includes the year, "
-                                   "or pass year: with the year from the question")
-            add(m, _mk_date(year, _mon(m.group("mon")), d, text))
-        for m in list(re.finditer(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTH_RX}\b", text, re.I)):
-            if year is None:
-                raise ExtractError(f"{m.group(0)!r} has no year", hint="quote a span that includes the year, "
-                                   "or pass year: with the year from the question")
-            add(m, _mk_date(year, _mon(m.group("mon")), int(m.group(1)), text))
-    if not found:
-        if re.search(rf"\b{_MONTH_RX}\s+\d{{4}}\b", text, re.I):
-            raise ExtractError(f"{_clip(text)!r} names a month but no day")
-        raise ExtractError(f"no date found in {_clip(text)!r}")
     found.sort()
-    distinct = {d for _, _, d in found}
-    if len(distinct) > 1:
-        raise ExtractError(f"found {len(distinct)} different dates ({', '.join(sorted(map(str, distinct)))}) in "
-                           f"{_clip(text)!r}; quote only the one you want")
-    s, e, d = found[0]
-    return Parsed(DateV(d), (s, e), {"iso": d.isoformat()})
+    if not found:
+        raise extraction(f"no date found in {text[:80]!r}", hint="quote the exact date text")
+    if len({f[2] for f in found}) > 1:
+        raise extraction(
+            f"{len(found)} dates found in {text[:80]!r}", hint="quote only the date you mean"
+        )
+    s, e, d, name = found[0]
+    return Extracted(d, None, s, e, {"date": d.isoformat(), "pattern": name})
 
 
-_DT_ISO = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d{1,9})?)?(?:\s?(?:Z|[+-]\d{2}:?\d{2}))?")
-_DT_NGINX = re.compile(r"\d{1,2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2}(?:\s[+-]\d{4})?")
+DATETIME_RE = re.compile(
+    r"(?<!\d)(?P<date>\d{4}-\d{2}-\d{2})[T ](?P<time>\d{2}:\d{2}(?::\d{2}(?:[.,]\d{1,6})?)?)"
+    r"(?P<tz>Z|[+-]\d{2}:?\d{2})?(?!\d)"
+)
 
 
-def extract_datetime(text: str) -> Parsed:
-    hits: list[tuple[int, int, datetime]] = []
-    for m in _DT_ISO.finditer(text):
-        s = m.group(0)
-        core = re.sub(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2})(?!:)", r"\1:00", s)
-        dt = parse_iso_ts(core)
-        if dt is None:
-            raise ExtractError(f"{s!r} is not a valid date and time")
-        hits.append((m.start(), m.end(), dt))
-    for m in _DT_NGINX.finditer(text):
-        from ..ingest.logs import parse_timestamp
-
-        ts = parse_timestamp(m.group(0))
-        dt = parse_iso_ts(ts.ts) if ts else None
-        if dt is not None:
-            hits.append((m.start(), m.end(), dt))
-    if not hits:
-        if re.search(r"\d{4}-\d{2}-\d{2}", text):
-            raise ExtractError(f"{_clip(text)!r} has a date but no time of day; use DATE(...)")
-        raise ExtractError(f"no date and time found in {_clip(text)!r}")
-    if len({h[2] for h in hits}) > 1:
-        raise ExtractError(f"found {len(hits)} timestamps in {_clip(text)!r}; quote only the one you want")
-    s, e, dt = hits[0]
-    return Parsed(DateTimeV(dt), (s, e), {"iso": dt.isoformat()})
+def parse_datetime(text: str) -> Extracted:
+    ms = list(DATETIME_RE.finditer(text))
+    m = _one(ms, "date-time", text)
+    raw = m.group(0).replace(" ", "T", 1).replace(",", ".")
+    tz = m.group("tz")
+    if tz == "Z":
+        raw = raw[:-1] + "+00:00"
+    elif tz and ":" not in tz:
+        raw = raw[: -len(tz)] + tz[:3] + ":" + tz[3:]
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise extraction(f"invalid date-time {m.group(0)!r}") from exc
+    return Extracted(dt, None, m.start(), m.end(), {"datetime": dt.isoformat()})
 
 
-_UNIT_SECONDS = {"ms": Decimal("0.001"), "s": Decimal(1), "m": Decimal(60), "h": Decimal(3600),
-                 "d": Decimal(86400), "w": Decimal(604800)}
-_UNIT_ALIASES = {"millisecond": "ms", "milliseconds": "ms", "second": "s", "seconds": "s", "sec": "s", "secs": "s",
-                 "minute": "m", "minutes": "m", "min": "m", "mins": "m", "hour": "h", "hours": "h", "hr": "h",
-                 "hrs": "h", "day": "d", "days": "d", "week": "w", "weeks": "w"}
-_DUR_TOKEN = re.compile(
-    r"(?<![\w.])(?P<n>\d+(?:\.\d+)?)\s*(?P<u>milliseconds?|ms|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?"
-    r"|s|m|h|d|w)(?![A-Za-z])")
+_DUR_UNITS = {
+    "ms": Decimal("0.001"),
+    "millisecond": Decimal("0.001"),
+    "milliseconds": Decimal("0.001"),
+    "s": Decimal(1),
+    "sec": Decimal(1),
+    "secs": Decimal(1),
+    "second": Decimal(1),
+    "seconds": Decimal(1),
+    "m": Decimal(60),
+    "min": Decimal(60),
+    "mins": Decimal(60),
+    "minute": Decimal(60),
+    "minutes": Decimal(60),
+    "h": Decimal(3600),
+    "hr": Decimal(3600),
+    "hrs": Decimal(3600),
+    "hour": Decimal(3600),
+    "hours": Decimal(3600),
+    "d": Decimal(86400),
+    "day": Decimal(86400),
+    "days": Decimal(86400),
+    "w": Decimal(604800),
+    "week": Decimal(604800),
+    "weeks": Decimal(604800),
+}
+_DUR_PART = r"(\d+(?:\.\d+)?)\s?(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|hr|h|days?|d|weeks?|w)"
+DURATION_RE = re.compile(rf"(?<![\w.])(?:{_DUR_PART})(?:\s?{_DUR_PART})*(?![A-Za-z])")
+_ISO_DUR_RE = re.compile(r"\bP(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?\b")
 
 
-def _td(seconds: Decimal) -> timedelta:
-    return timedelta(microseconds=int((seconds * 1_000_000).to_integral_value()))
-
-
-def extract_duration(text: str) -> Parsed:
-    m = re.search(r"\bP(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?\b", text)
-    if m and m.group(0) != "P" and any(m.groups()):
-        d, h, mi, s = (Decimal(g or 0) for g in m.groups())
-        return Parsed(DurationV(_td(d * 86400 + h * 3600 + mi * 60 + s)), (m.start(), m.end()), {"iso8601": m.group(0)})
-    m = re.search(r"(?<![\d:])(\d+):([0-5]\d):([0-5]\d(?:\.\d+)?)(?![\d:])", text)
-    if m:
-        secs = Decimal(m.group(1)) * 3600 + Decimal(m.group(2)) * 60 + Decimal(m.group(3))
-        return Parsed(DurationV(_td(secs)), (m.start(), m.end()), {"clock": m.group(0)})
-    toks = list(_DUR_TOKEN.finditer(text))
-    if not toks:
-        raise ExtractError(f"no duration found in {_clip(text)!r}", hint="expected e.g. '250 ms', '3h 20m', '1.5 hours'")
-    runs: list[list[re.Match[str]]] = [[toks[0]]]
-    for prev, cur in zip(toks, toks[1:]):
-        if re.fullmatch(r"[\s,]*(?:and\s+)?", text[prev.end() : cur.start()]):
-            runs[-1].append(cur)
-        else:
-            runs.append([cur])
-    if len(runs) > 1:
-        raise ExtractError(f"found {len(runs)} separate durations in {_clip(text)!r}; quote only the one you want")
+def parse_duration(text: str) -> Extracted:
+    ms = [m for m in DURATION_RE.finditer(text)]
+    iso = [m for m in _ISO_DUR_RE.finditer(text) if m.group(0) != "P"]
+    if iso and not ms:
+        m = _one(iso, "duration", text)
+        d, h, mi, s = (Decimal(x) if x else Decimal(0) for x in m.groups())
+        secs = d * 86400 + h * 3600 + mi * 60 + s
+        return Extracted(secs, "s", m.start(), m.end(), {"seconds": str(secs)})
+    m = _one(ms, "duration", text)
     total = Decimal(0)
-    for t in runs[0]:
-        unit = _UNIT_ALIASES.get(t.group("u").lower(), t.group("u").lower())
-        total += Decimal(t.group("n")) * _UNIT_SECONDS[unit]
-    return Parsed(DurationV(_td(total)), (runs[0][0].start(), runs[0][-1].end()), {"seconds": plain(total)})
+    for num, unit in re.findall(_DUR_PART, m.group(0)):
+        total += Decimal(num) * _DUR_UNITS[unit]
+    return Extracted(total, "s", m.start(), m.end(), {"seconds": str(total)})
 
 
-_TRUE = {"yes", "true", "enabled", "on", "y", "active", "allowed"}
-_FALSE = {"no", "false", "disabled", "off", "n", "inactive", "denied"}
+_TRUE = {"true", "yes", "on", "enabled", "enable", "y"}
+_FALSE = {"false", "no", "off", "disabled", "disable", "n"}
+BOOL_RE = re.compile(r"(?i)\b(true|false|yes|no|on|off|enabled|disabled|enable|disable)\b")
 
 
-def extract_bool(text: str) -> Parsed:
-    s = text.strip().strip(".,;:!").strip().lower()
-    if s in _TRUE:
-        v = True
-    elif s in _FALSE:
-        v = False
-    else:
-        raise ExtractError(f"cannot read {_clip(text)!r} as yes/no",
-                           hint="the span must be just yes/no, true/false, enabled/disabled or on/off")
-    lead = len(text) - len(text.lstrip())
-    return Parsed(BoolV(v), (lead, lead + len(text.strip())), {})
-
-
-def extract_text(text: str) -> Parsed:
-    return Parsed(Text(text), (0, len(text)), {})
-
-
-def extract(kind: str, text: str, **kw) -> Parsed:
-    """Dispatch by extractor name (``num``, ``money``, ``pct``, ``date``, ``datetime``, ``duration``, ``text``, ``bool``)."""
-    k = kind.lower()
-    if k == "num":
-        return extract_num(text, kw.get("locale"))
-    if k == "money":
-        return extract_money(text, kw.get("locale"))
-    if k in ("pct", "pct_of"):
-        return extract_pct(text, kw.get("locale"))
-    if k == "date":
-        return extract_date(text, kw.get("fmt"), kw.get("year"))
-    if k == "datetime":
-        return extract_datetime(text)
-    if k == "duration":
-        return extract_duration(text)
-    if k == "bool":
-        return extract_bool(text)
-    if k == "text":
-        return extract_text(text)
-    raise ExtractError(f"unknown extractor {kind!r}")
-
+def parse_bool(text: str) -> Extracted:
+    m = _one(list(BOOL_RE.finditer(text)), "boolean", text)
+    w = m.group(1).lower()
+    return Extracted(w in _TRUE, None, m.start(), m.end(), {"token": m.group(1)})

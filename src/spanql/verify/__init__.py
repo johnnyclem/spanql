@@ -1,5 +1,3 @@
-from .literals import check_literals, check_prose
-from .pipeline import verify_formula
-from .relevance import RelevanceChecker
+from spanql.verify.checks import check_literals, check_template, is_count_question
 
-__all__ = ["verify_formula", "check_literals", "check_prose", "RelevanceChecker"]
+__all__ = ["check_literals", "check_template", "is_count_question"]

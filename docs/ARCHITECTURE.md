@@ -1,6 +1,8 @@
 # Architecture
 
-> The span store, formula language, engine, verifier and provenance described here are implemented (see [IMPLEMENTATION.md](IMPLEMENTATION.md), which also lists every place the code differs from or resolves an ambiguity in this document). The Docling converters, tree-sitter symbols for non-Python languages, vectors and the Concussion-Protocol gate are not.
+> **Implementation note (2026-11-19):** the first implementation differs from this document in a few places (snapshot ids, `match:` keyword, comparisons in the grammar, `[n]` references, strict V4, regex timeouts, Starlette/argparse, runtime defaults, Docker/Homebrew details). See [ADR-0007](adr/0007-implementation-deviations.md).
+
+> Design phase. Nothing here is implemented. Names, schemas and grammar are proposals.
 
 spanql has three cooperating parts with a hard boundary between them:
 
@@ -119,7 +121,7 @@ SQLite is chosen because it's one file, embeds everywhere (Docker volume, Homebr
 ### 2.1 Design rules
 
 1. **Small.** A model that can write an Excel formula can write a spanql formula. Prefix function calls, infix arithmetic, nothing else.
-2. **References, not literals.** Every value that comes from your data enters through a *reference*: a span handle, a quote, or a query. Numeric literals are allowed only as formatting/configuration parameters (`places:1`) or obvious constants, and the verifier flags them (see §5).
+2. **References, not literals.** Every value that comes from your data enters through a *reference*: a span handle, a quote, or a query. Numeric literals are allowed only as formatting/configuration parameters (`places:1`), inside query filters, or when the user typed the number in the question; anything else is rejected (see §5 and [ADR-0007](adr/0007-implementation-deviations.md) decision 23).
 3. **Total and deterministic.** No loops, no user-defined functions, no I/O. Every formula terminates; the same formula over the same snapshots gives the same value.
 4. **Typed.** `Text`, `Number` (decimal, with optional unit/currency), `Date`, `DateTime`, `Duration`, `Bool`, `SpanSet` (a set of spans), `Table`. Type errors are verifier failures, which become retry feedback for the model.
 5. **Compiles to a plan.** Formulas aren't interpreted ad hoc; they compile to a logical query plan whose leaf nodes are SQL over the span store.

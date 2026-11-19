@@ -1,0 +1,5 @@
+invoice,customer,region,amount,date
+INV-001,Acme Corp,West,1200.50,2026-10-01
+INV-002,Globex,East,"3,400.00",2026-10-05
+INV-003,Initech,West,875.25,2026-10-09
+INV-004,"Umbrella, Inc.",Central,2100.00,2026-10-12
