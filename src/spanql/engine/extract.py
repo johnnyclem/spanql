@@ -98,9 +98,16 @@ class Extracted:
     parsed: dict[str, Any]
 
 
+# the full run of digits and separators a number token sits in ("1.234,50")
+_RUN_RE = re.compile(r"[\d.,]*\d")
+
+
 def _quantities(text: str) -> list[re.Match[str]]:
     out = []
+    covered = -1  # end of the last unreadable separator run; its pieces aren't separate numbers
     for m in QUANTITY_RE.finditer(text):
+        if m.start("num") < covered:
+            continue
         # skip things that look like parts of dates/times/versions/identifiers
         a, b = m.start("num"), m.end("num")
         before = text[max(0, a - 1) : a]
@@ -111,8 +118,29 @@ def _quantities(text: str) -> list[re.Match[str]]:
             continue
         if after == "." and text[b + 1 : b + 2].isdigit():
             continue  # version like 1.2.3
+        run = _RUN_RE.match(text, a)
+        if run is not None and run.end() > b and _separator_run(run.group(0)):
+            covered = run.end()
         out.append(m)
     return out
+
+
+def _separator_run(run: str) -> bool:
+    """True for digit runs whose separators spanql won't guess at: European ``1.234,50``,
+    ``1.234.567``, decimal-comma ``12,5`` next to a decimal point, and similar."""
+    return ("," in run and "." in run) or run.count(".") > 1 or bool(re.search(r",\d{1,2}$", run))
+
+
+def _check_separators(m: re.Match[str], text: str) -> None:
+    a = m.start("num")
+    run = _RUN_RE.match(text, a)
+    if run is not None and run.end() > m.end("num") and _separator_run(run.group(0)):
+        raise extraction(
+            f"can't read {run.group(0)!r} unambiguously: its separators could mean thousands "
+            "or decimals (e.g. 1.234,50 = 1234.50 in many locales)",
+            hint="spanql reads numbers written like 1,234.50; quote a value written that way, "
+            "or answer NOT_FOUND / AMBIGUOUS",
+        )
 
 
 def _one(matches: list[Any], what: str, text: str) -> Any:
@@ -147,6 +175,7 @@ def parse_quantity(text: str, *, require: str | None = None) -> Extracted:
         m = _one(ms, "percentage", text)
     else:
         m = _one(ms, "number", text)
+    _check_separators(m, text)
     value = _to_decimal(m.group("num"))
     scale = m.group("scale")
     # a lone uppercase letter like "M" after a number with no currency is still a scale;

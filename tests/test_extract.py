@@ -88,3 +88,31 @@ def test_formatting() -> None:
     assert format_number(Decimal("11.83"), "%", 1) == "11.8%"
     assert quantize(Decimal("2.345"), 2) == Decimal("2.35")  # HALF_UP
     assert display(Value("Number", Decimal("1284"), None)) == "1,284"
+
+
+@pytest.mark.parametrize(
+    "text", ["€1.234,50", "Revenue: €1.234,50 in the EU store.", "12,5 %", "$10,20"]
+)
+def test_ambiguous_separators_are_refused(text: str) -> None:
+    with pytest.raises(EngineError) as exc:
+        parse_quantity(text)
+    assert exc.value.problem.code == "V3" and "unambiguously" in exc.value.problem.message
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("$1,234.50", "1234.50"),
+        ("costs $5, and more", "5"),
+        ("€1,234.5", "1234.5"),
+        ("3.25", "3.25"),
+    ],
+)
+def test_ordinary_separators_still_parse(text: str, value: str) -> None:
+    assert parse_quantity(text).value == Decimal(value)
+
+
+def test_dotted_thousands_are_not_read_as_a_number() -> None:
+    with pytest.raises(EngineError) as exc:  # 1.234.567 looks like a version; never 1.234
+        parse_quantity("EUR 1.234.567")
+    assert exc.value.problem.code == "V3"
