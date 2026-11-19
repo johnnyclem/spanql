@@ -14,6 +14,7 @@ from typing import Any
 from spanql.engine.errors import extraction, support, syntax
 from spanql.formula.ast import BoolLit, Call, Compare, Node, NumberLit, StringLit, unparse
 from spanql.ingest.logs import LEVELS
+from spanql.store import saferegex
 from spanql.store.db import Span, Store
 from spanql.store.globs import glob_match
 
@@ -164,6 +165,13 @@ def _sql_str(s: str) -> str:
     return s.replace("'", "''")
 
 
+def _check_regex(pattern: str, fn: str, pos: int | None) -> None:
+    try:
+        saferegex.check_pattern(pattern)
+    except saferegex.UnsafePattern as exc:
+        raise syntax(f"{fn}: {exc}", hint=exc.hint, pos=pos) from exc
+
+
 def check_src(store: Store, pattern: str, fn: str, pos: int | None = None) -> None:
     """V5: a ``src:`` glob that matches no ingested source is an error, not "0 matches".
 
@@ -242,10 +250,7 @@ def _common(
                 bld.add(f"b.kind IN ({', '.join('?' * len(blk_kinds))})", *blk_kinds)
     if (rx := call.kw("re")) is not None:
         pattern = _lit(rx, "re", fn)
-        try:
-            re.compile(pattern)
-        except re.error as exc:
-            raise syntax(f"{fn}: invalid regex {pattern!r}: {exc}", pos=rx.pos) from exc
+        _check_regex(pattern, fn, rx.pos)
         bld.need_snapshot = True
         bld.add("regexp(?, substr(s.text, b.start + 1, b.end - b.start))", pattern)
 
@@ -380,16 +385,13 @@ def _check_header_exists(store: Store, header: str, call: Call) -> None:
 def run_lines(store: Store, call: Call) -> QueryResult:
     rx = call.kw("re")
     pattern = _lit(rx, "re", "LINES")
-    try:
-        creg = re.compile(pattern)
-    except re.error as exc:
-        raise syntax(f"LINES: invalid regex {pattern!r}: {exc}") from exc
+    _check_regex(pattern, "LINES", rx.pos if rx is not None else None)
     where, params = ["src.removed = 0", "src.current_snapshot IS NOT NULL"], []
     if (src := call.kw("src")) is not None:
-        pattern = _lit(src, "src", "LINES")
-        check_src(store, pattern, "LINES", src.pos)
+        src_glob = _lit(src, "src", "LINES")
+        check_src(store, src_glob, "LINES", src.pos)
         where.append("spanql_glob(?, src.uri)")
-        params.append(pattern)
+        params.append(src_glob)
     if (k := call.kw("kind")) is not None:
         where.append("src.kind = ?")
         params.append(_lit(k, "kind", "LINES"))
@@ -401,7 +403,7 @@ def run_lines(store: Store, call: Call) -> QueryResult:
         pos = 0
         for line in data.split(b"\n"):
             text = line.decode("utf-8", "replace")
-            if creg.search(text):
+            if saferegex.search(pattern, text):
                 spans.append(Span(row["current_snapshot"], pos, pos + len(line)))
                 uris.append(row["uri"])
             pos += len(line) + 1

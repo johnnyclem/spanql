@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -27,6 +28,7 @@ from spanql.formula.ast import (
     StringLit,
     unparse,
 )
+from spanql.store import saferegex
 from spanql.store.db import Span, Store
 
 TEXTLIKE = ("Text", "Span")
@@ -39,6 +41,7 @@ class EvalContext:
     count_question: bool = True  # V5: COUNT over zero matches is an answer only for counts
     cell_lookup: Callable[[str], dict[str, Any] | None] | None = None
     queries: list[dict[str, Any]] = field(default_factory=list)
+    query_timeout_s: float | None = None  # None: saferegex.DEFAULT_TIMEOUT_S at call time
 
 
 def _span_input(
@@ -525,7 +528,21 @@ class Evaluator:
             "LINES": q.run_lines,
             "COLUMN": q.run_column,
         }[c.name]
-        res = runner(self.ctx.store, c)
+        budget = self.ctx.query_timeout_s or saferegex.DEFAULT_TIMEOUT_S
+        try:
+            with saferegex.deadline(budget):
+                res = runner(self.ctx.store, c)
+                if saferegex.timed_out():
+                    raise saferegex.RegexTimeout(c.name)
+        except (saferegex.RegexTimeout, sqlite3.OperationalError) as exc:
+            if isinstance(exc, sqlite3.OperationalError) and "interrupt" not in str(exc):
+                raise
+            raise syntax(
+                f"{c.name} took longer than {budget:g}s and was stopped",
+                hint="simplify the re: pattern (avoid nested or overlapping repeats) "
+                "or narrow src:",
+                pos=c.pos,
+            ) from exc
         rec = res.record()
         self.ctx.queries.append(rec)
         step = {

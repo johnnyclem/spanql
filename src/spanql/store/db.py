@@ -12,11 +12,11 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from spanql.blocks import BlockSpec, Converted
+from spanql.store import saferegex
 from spanql.store.globs import glob_match
 from spanql.store.schema import SCHEMA, SCHEMA_VERSION
 
@@ -35,22 +35,27 @@ def now_iso() -> str:
     return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
 
 
-@lru_cache(maxsize=256)
-def _compile(pattern: str) -> re.Pattern[str]:
-    return re.compile(pattern)
-
-
 def _regexp(pattern: str | None, value: Any) -> int:
     if pattern is None or value is None:
         return 0
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
-    return 1 if _compile(pattern).search(str(value)) else 0
+    try:
+        return 1 if saferegex.search(pattern, str(value)) else 0
+    except saferegex.RegexTimeout:
+        # exceptions can't cross the SQLite callback cleanly; the flag is set and the progress
+        # handler aborts the statement, which the engine reports as a timeout
+        return 0
 
 
 _NUM_RE = re.compile(
     r"^\s*\(?\s*[-−]?\s*(?:US\$|\$|€|£|¥)?\s*[-−]?\d[\d,]*(?:\.\d+)?\s*%?\s*\)?\s*$"
 )
+
+
+def _progress() -> int:
+    """SQLite progress handler: abort the running statement once the query deadline passed."""
+    return 1 if saferegex.timed_out() or saferegex.expired() else 0
 
 
 def _num(value: Any) -> float | None:
@@ -140,6 +145,7 @@ class Store:
         self.conn.create_function("regexp", 2, _regexp, deterministic=True)
         self.conn.create_function("spanql_glob", 2, glob_match, deterministic=True)
         self.conn.create_function("spanql_num", 1, _num, deterministic=True)
+        self.conn.set_progress_handler(_progress, 20_000)
         self.conn.execute("PRAGMA foreign_keys=ON")
         if self.path != ":memory:":
             self.conn.execute("PRAGMA journal_mode=WAL")
