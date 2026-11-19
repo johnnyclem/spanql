@@ -1,10 +1,14 @@
 # Homebrew formula for spanql (for the johnnyclem/homebrew-spanql tap).
 #
 # Resources are generated from uv.lock so the bottle pins exactly what CI tested:
-#   uv export --no-dev --extra code --extra pdf --no-hashes --no-emit-project \
+#   uv export --no-dev --extra pdf --no-hashes --no-emit-project \
 #     | python3 packaging/homebrew/gen_resources.py
 #
-# The repository is private and has no release tag yet, so this formula is HEAD-only.
+# The tree-sitter `code` extra is left out: Homebrew builds resources from sdists, and the
+# tree-sitter-typescript 0.23.2 sdist doesn't compile (missing tree_sitter/parser.h for tsx).
+# Python symbols use the stdlib ast; TS/JS/Go symbols fall back to a regex extractor.
+#
+# The repository and has no release tag yet, so this formula is HEAD-only.
 # On the first release add:
 #   url "https://github.com/johnnyclem/spanql/archive/refs/tags/v0.1.0.tar.gz"
 #   sha256 "<sha256 of that tarball>"
@@ -67,26 +71,6 @@ class Spanql < Formula
   resource "starlette" do
     url "https://files.pythonhosted.org/packages/48/bb/3d8757f21e9a53d9035c9eb039a777047139a16bfdbedfc7a58241c3d914/starlette-1.10.0.tar.gz"
     sha256 "b8399098d4c1e3522734f7235dc79b1fc967f96cf139c81e0fa30479e0685f9b"
-  end
-
-  resource "tree-sitter" do
-    url "https://files.pythonhosted.org/packages/e6/ca/3d69b21b2328dadee34a6cae65bc84e2b4e0c72bfb9147b7a2d4ba8110a0/tree_sitter-0.26.1.tar.gz"
-    sha256 "9919cbaf02d17fa9a4cd0e6da496aecf901b758e6eacf122eee393e3ef08aacd"
-  end
-
-  resource "tree-sitter-go" do
-    url "https://files.pythonhosted.org/packages/01/05/727308adbbc79bcb1c92fc0ea10556a735f9d0f0a5435a18f59d40f7fd77/tree_sitter_go-0.25.0.tar.gz"
-    sha256 "a7466e9b8d94dda94cae8d91629f26edb2d26166fd454d4831c3bf6dfa2e8d68"
-  end
-
-  resource "tree-sitter-javascript" do
-    url "https://files.pythonhosted.org/packages/59/e0/e63103c72a9d3dfd89a31e02e660263ad84b7438e5f44ee82e443e65bbde/tree_sitter_javascript-0.25.0.tar.gz"
-    sha256 "329b5414874f0588a98f1c291f1b28138286617aa907746ffe55adfdcf963f38"
-  end
-
-  resource "tree-sitter-typescript" do
-    url "https://files.pythonhosted.org/packages/1e/fc/bb52958f7e399250aee093751e9373a6311cadbe76b6e0d109b853757f35/tree_sitter_typescript-0.23.2.tar.gz"
-    sha256 "7b167b5827c882261cb7a50dfa0fb567975f9b315e87ed87ad0a0a3aedb3834d"
   end
 
   resource "typing-extensions" do

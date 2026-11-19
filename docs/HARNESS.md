@@ -1,5 +1,7 @@
 # Agent harness
 
+> **Implementation note (2026-11-19):** the first implementation differs from this document in a few places (snapshot ids, `match:` keyword, comparisons in the grammar, Starlette/argparse, runtime defaults, Docker/Homebrew details). See [ADR-0007](adr/0007-implementation-deviations.md).
+
 > Design phase.
 
 The harness is the "agent app": it turns a chat message into retrieval, one or more formula attempts, evaluation, verification, and a rendered answer. It is deliberately a **bounded loop with a fixed toolset**, not an open-ended agent: the model never runs shell commands, never reads files directly, and never sees more than the candidates the harness gives it.

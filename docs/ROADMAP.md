@@ -1,6 +1,21 @@
 # Roadmap
 
-> Design phase. Milestones are ordered; dates are deliberately absent until M0 is approved.
+> Milestones are ordered; dates are deliberately absent until M0 is approved.
+
+## Status (2026-11-19, branch `feat/implementation`)
+
+| # | Status |
+| --- | --- |
+| M0 | **Open**: design not formally signed off; license not chosen |
+| M1 | **Done** (exit criteria covered by tests: no-op re-ingest, byte-exact spans, re-anchoring) |
+| M2 | **Done** (`/v1/evaluate`, `spanql trace`, property tests for determinism) |
+| M3 | **Mostly done**: harness, GBNF, retries, refusals, CLI `ask` work against llama.cpp. `eval/RESULTS.md` baseline not produced; only informal [eval/SMOKE.md](../eval/SMOKE.md) |
+| M4 | Not started |
+| M5 | **Partial**: API, SSE, OpenAI-compatible endpoint, simple web UI with cell chips and provenance panel, recompute/staleness. No exports; not dogfooded yet |
+| M6 | **Partial**: Docker image built and run; compose and Homebrew formula written, `brew style` clean; not verified on a fresh Mac or with `docker compose up` |
+| M7 | Not started |
+| M8 | **Partial**: MCP server (stdio). No Docling/PDF highlight |
+
 
 | # | Milestone | Scope | Exit criteria |
 | --- | --- | --- | --- |
@@ -21,4 +36,4 @@
 3. **Primary corpus for dogfooding.** Which repos/logs/docs should M5 target first?
 4. **Fine-tune compute.** Local Apple Silicon (MLX LoRA) only, or rent a GPU for TRL/Unsloth runs?
 5. **Teacher model for synthetic data.** Local larger model vs. a hosted API (cost and data-sharing trade-off; only public corpora would be sent).
-6. **Public or private long term?** The repo is private for now.
+6. **Public or private long term?** The design assumed a private repo, but GitHub currently reports `johnnyclem/spanql` as **public**.

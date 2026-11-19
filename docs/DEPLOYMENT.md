@@ -1,5 +1,7 @@
 # Deployment
 
+> **Implementation note (2026-11-19):** the first implementation differs from this document in a few places (snapshot ids, `match:` keyword, comparisons in the grammar, Starlette/argparse, runtime defaults, Docker/Homebrew details). See [ADR-0007](adr/0007-implementation-deviations.md).
+
 > Design phase. File names, ports and paths are proposals.
 
 spanql ships two ways, from one codebase:

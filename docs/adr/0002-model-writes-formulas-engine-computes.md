@@ -1,6 +1,6 @@
 # ADR-0002: The model writes formulas; a deterministic engine computes values
 
-- Status: Proposed
+- Status: Proposed (implemented on `feat/implementation`; deviations in [ADR-0007](0007-implementation-deviations.md))
 - Date: 2026-11-17
 
 ## Context

@@ -1,5 +1,7 @@
 # Architecture
 
+> **Implementation note (2026-11-19):** the first implementation differs from this document in a few places (snapshot ids, `match:` keyword, comparisons in the grammar, Starlette/argparse, runtime defaults, Docker/Homebrew details). See [ADR-0007](adr/0007-implementation-deviations.md).
+
 > Design phase. Nothing here is implemented. Names, schemas and grammar are proposals.
 
 spanql has three cooperating parts with a hard boundary between them:
