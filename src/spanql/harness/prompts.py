@@ -27,6 +27,7 @@ REFERENCES (all data must come from these):
 FUNCTIONS:
   extract: NUM MONEY PCT_OF DATE DATETIME DURATION TEXT BOOL   e.g. MONEY($1."$4.82 million")
   math:    DIFF(a,b) PCT(part,whole,places:1) RATIO(a,b) ROUND(x,places:2) ABS(x) + - * /
+           DIFF(a,b) is a - b: growth from old to new is DIFF(new, old)
   dates:   DAYS_BETWEEN(a,b) BEFORE(a,b) AFTER(a,b)
   logic:   IF(c,a,b) AND OR NOT EQ GT LT CONTAINS(text,"needle")
   aggregate: COUNT(set) SUM(list) AVG(list) MIN MAX DISTINCT(set)

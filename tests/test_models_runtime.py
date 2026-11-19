@@ -102,7 +102,9 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(200); self.end_headers(); self.wfile.write(b'{"status":"ok"}')
     def log_message(self, *a):
         pass
-http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+srv = http.server.HTTPServer(("127.0.0.1", port), H)
+print("listening", port, file=sys.stderr, flush=True)
+srv.serve_forever()
 """
 
 
@@ -128,7 +130,7 @@ def test_managed_runtime_spawns_supervises_and_stops(tmp_path: Path) -> None:
 
     def why() -> str:
         code = rt.proc.poll() if rt.proc else None
-        return f"exit={code} restarts={rt.restarts} log={log.read_text() if log.exists() else ''!r}"
+        return f"exit={code} restarts={rt.restarts} last_error={rt.last_error!r} log={log.read_text() if log.exists() else ''!r}"
 
     (tmp_path / "m.gguf").write_bytes(b"GGUF")
     cfg = Config(model=ModelConfig(model=str(tmp_path / "m.gguf"), llama_server_bin=str(binary)))

@@ -27,6 +27,7 @@ class ManagedLlamaServer:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.restarts = 0
+        self.last_error: str | None = None
 
     @property
     def endpoint(self) -> str:
@@ -111,9 +112,11 @@ class ManagedLlamaServer:
             try:
                 r = httpx.get(f"http://{self.host}:{self.port}/health", timeout=2)
                 if r.status_code == 200:
+                    self.last_error = None
                     return True
-            except httpx.HTTPError:
-                pass
+                self.last_error = f"/health returned {r.status_code}"
+            except httpx.HTTPError as e:
+                self.last_error = f"{type(e).__name__}: {e}"
             if self.proc and self.proc.poll() is not None and self.restarts > 3:
                 return False
             time.sleep(0.5)
